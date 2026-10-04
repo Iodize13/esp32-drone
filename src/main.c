@@ -46,7 +46,7 @@
 #define WHO_MPU6050       (0x68U)
 #define BURST_LEN         (14U)
 
-#define DLPF_CFG          (0x03U)        /* 0x03=41 Hz, 0x04=20 Hz, 0x05=10 Hz */
+#define DLPF_CFG          (0x05U)        /* 0x03=41 Hz, 0x04=20 Hz, 0x05=10 Hz */
 #define SMPLRT_DIV_1KHZ   (0x00U)
 #define ACCEL_LSB_PER_G   (16384.0f)
 #define GYRO_LSB_PER_DPS  (131.0f)
