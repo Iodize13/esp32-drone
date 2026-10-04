@@ -7,8 +7,10 @@
  *   GND common between board, driver board and motor battery minus.
  *
  * Press BOOT (GPIO0) to start. Press BOOT again at any time = motors off.
- *   RUN_THRUST_TEST 0: idle baseline -> all motors 40 % -> each motor alone
- *   RUN_THRUST_TEST 1: slow ramp 0 -> 100 % to see if it lifts
+ *   TEST_MODE TEST_VIBRATION: idle baseline -> all motors 40 % -> each alone
+ *   TEST_MODE TEST_THRUST   : slow ramp 0 -> 100 % to see if it lifts
+ *   TEST_MODE TEST_MAPPING  : find where each motor sits, print the
+ *                             mixer sign table (PROPS OFF)
  *
  * Serial: COM port, 115200.
  */
@@ -24,9 +26,13 @@
 #include "driver/ledc.h"
 #include "esp_timer.h"
 #include "esp_rom_sys.h"
+#include "attitude_filter.h"
 
 /* ------------------------------------------------------------------ */
-#define RUN_THRUST_TEST   (0U)
+#define TEST_VIBRATION    (0U)
+#define TEST_THRUST       (1U)
+#define TEST_MAPPING      (2U)
+#define TEST_MODE         (TEST_MAPPING)
 
 #define PIN_SDA           (8)
 #define PIN_SCL           (9)
@@ -46,7 +52,7 @@
 #define WHO_MPU6050       (0x68U)
 #define BURST_LEN         (14U)
 
-#define DLPF_CFG          (0x05U)        /* 0x03=41 Hz, 0x04=20 Hz, 0x05=10 Hz */
+#define DLPF_CFG          (0x04U)        /* 0x03=41 Hz, 0x04=20 Hz, 0x05=10 Hz */
 #define SMPLRT_DIV_1KHZ   (0x00U)
 #define ACCEL_LSB_PER_G   (16384.0f)
 #define GYRO_LSB_PER_DPS  (131.0f)
@@ -384,6 +390,29 @@ static bool mpu_read_gyro(float g[AXES], float *az)
         g[0] = (float)be16(&b[8])  / GYRO_LSB_PER_DPS;
         g[1] = (float)be16(&b[10]) / GYRO_LSB_PER_DPS;
         g[2] = (float)be16(&b[12]) / GYRO_LSB_PER_DPS;
+    }
+    else
+    {
+        /* leave outputs untouched */
+    }
+
+    return ok;
+}
+
+/* acc[] in g, g[] in dps */
+static bool mpu_read_all(float acc[AXES], float g[AXES])
+{
+    uint8_t b[BURST_LEN];
+    bool    ok = mpu_read(REG_ACCEL_XOUT_H, b, sizeof(b));
+
+    if (ok == true)
+    {
+        acc[0] = (float)be16(&b[0])  / ACCEL_LSB_PER_G;
+        acc[1] = (float)be16(&b[2])  / ACCEL_LSB_PER_G;
+        acc[2] = (float)be16(&b[4])  / ACCEL_LSB_PER_G;
+        g[0]   = (float)be16(&b[8])  / GYRO_LSB_PER_DPS;
+        g[1]   = (float)be16(&b[10]) / GYRO_LSB_PER_DPS;
+        g[2]   = (float)be16(&b[12]) / GYRO_LSB_PER_DPS;
     }
     else
     {
@@ -733,6 +762,266 @@ static void thrust_test(void)
     printf((aborted == true) ? "ABORTED - motors off\n\n" : "done - motors off\n\n");
 }
 
+
+/* ================================================================== */
+/* Motor mapping test (PROPS OFF)                                      */
+/*                                                                     */
+/* For each motor: it spins briefly so you can see which one it is,    */
+/* then you press THAT motor's corner down ~15-20 deg and hold. The    */
+/* sign of roll/pitch while that corner is low gives the mixer sign:   */
+/* a motor on the LOW side of a positive angle must be -1 (mixer.h).   */
+/* ================================================================== */
+#define MAP_DUTY          (250U)         /* 25 %, props off           */
+#define MAP_SPIN_MS       (1500U)
+#define MAP_BIAS_SAMPLES  (1000U)        /* 1 s still at 1 kHz        */
+#define MAP_TILT_DEG      (8.0f)         /* corner counts as "down"   */
+#define MAP_LEVEL_DEG     (3.0f)         /* back to level             */
+#define MAP_HOLD_MS       (500U)         /* must hold this long       */
+#define MAP_TIMEOUT_MS    (30000U)
+#define MAP_PRINT_MS      (250U)
+#define ATT_TAU_S         (0.5f)
+#define ATT_ACC_MIN_G     (0.85f)
+#define ATT_ACC_MAX_G     (1.15f)
+#define LOOP_DT_S         (0.001f)
+
+static attitude_t s_att;
+
+/* one 1 ms filter step; returns false on read error */
+static bool att_step(void)
+{
+    float acc[AXES];
+    float raw[AXES];
+    float g[AXES];
+    bool  ok = mpu_read_all(acc, raw);
+
+    if (ok == true)
+    {
+        att_unbias(&s_att, raw, g);
+        att_update(&s_att, acc, g, LOOP_DT_S);
+    }
+    else
+    {
+        /* skip this step */
+    }
+
+    return ok;
+}
+
+static float absf(float x)
+{
+    return (x < 0.0f) ? -x : x;
+}
+
+/* Run the filter for ms. Returns true if BOOT aborted. */
+static bool att_run(uint32_t ms)
+{
+    TickType_t last    = xTaskGetTickCount();
+    uint32_t   i;
+    bool       aborted = false;
+
+    for (i = 0U; (i < ms) && (aborted == false); i++)
+    {
+        (void)att_step();
+        aborted = button_pressed();
+        vTaskDelayUntil(&last, 1);
+    }
+
+    return aborted;
+}
+
+/* Wait until want_tilt (corner held down) or level, held MAP_HOLD_MS.
+ * Returns 0 ok, 1 aborted, 2 timeout. Prints angles while waiting. */
+static uint32_t wait_pose(bool want_tilt)
+{
+    TickType_t last   = xTaskGetTickCount();
+    uint32_t   i;
+    uint32_t   held   = 0U;
+    uint32_t   result = 2U;
+    float      r;
+    float      p;
+    bool       match;
+
+    for (i = 0U; (i < MAP_TIMEOUT_MS) && (result == 2U); i++)
+    {
+        (void)att_step();
+        r = absf(s_att.roll_deg);
+        p = absf(s_att.pitch_deg);
+
+        if (want_tilt == true)
+        {
+            match = (r >= MAP_TILT_DEG) || (p >= MAP_TILT_DEG);
+        }
+        else
+        {
+            match = (r < MAP_LEVEL_DEG) && (p < MAP_LEVEL_DEG);
+        }
+
+        held = (match == true) ? (held + 1U) : 0U;
+
+        if (held >= MAP_HOLD_MS)
+        {
+            result = 0U;
+        }
+        else if (button_pressed() == true)
+        {
+            result = 1U;
+        }
+        else
+        {
+            /* keep waiting */
+        }
+
+        if ((i % MAP_PRINT_MS) == 0U)
+        {
+            printf("    roll %+6.1f  pitch %+6.1f\r", (double)s_att.roll_deg,
+                   (double)s_att.pitch_deg);
+            (void)fflush(stdout);
+        }
+        else
+        {
+            /* not a print step */
+        }
+        vTaskDelayUntil(&last, 1);
+    }
+    printf("\n");
+
+    return result;
+}
+
+/* +1 / -1 / 0 for an angle held with this motor's corner DOWN */
+static int8_t sign_when_low(float angle_deg)
+{
+    int8_t s;
+
+    if (angle_deg >= (MAP_TILT_DEG * 0.5f))
+    {
+        s = -1;          /* low side of a positive angle -> -1 */
+    }
+    else if (angle_deg <= -(MAP_TILT_DEG * 0.5f))
+    {
+        s = 1;
+    }
+    else
+    {
+        s = 0;           /* motor sits on this axis (plus layout) */
+    }
+
+    return s;
+}
+
+static void print_row(const char *name, const int8_t v[MOTOR_COUNT])
+{
+    printf("    .%-5s = { %+d, %+d, %+d, %+d },\n", name,
+           (int)v[0], (int)v[1], (int)v[2], (int)v[3]);
+}
+
+static void mapping_test(void)
+{
+    att_config_t acfg = { ATT_TAU_S, ATT_ACC_MIN_G, ATT_ACC_MAX_G };
+    int8_t       roll_s[MOTOR_COUNT]  = { 0, 0, 0, 0 };
+    int8_t       pitch_s[MOTOR_COUNT] = { 0, 0, 0, 0 };
+    int8_t       yaw_s[MOTOR_COUNT];
+    int32_t      sum_r = 0;
+    int32_t      sum_p = 0;
+    uint32_t     m;
+    uint32_t     i;
+    uint32_t     res  = 0U;
+    bool         ok   = true;
+    float        acc[AXES];
+    float        raw[AXES];
+
+    printf("MOTOR MAPPING - PROPS OFF. Keep the frame level and still...\n");
+    att_init(&s_att, &acfg);
+    for (i = 0U; i < MAP_BIAS_SAMPLES; i++)
+    {
+        if (mpu_read_all(acc, raw) == true)
+        {
+            att_bias_add(&s_att, raw);
+        }
+        else
+        {
+            /* skip */
+        }
+        vTaskDelay(1);
+    }
+    ok = att_bias_finish(&s_att, MAP_BIAS_SAMPLES / 2U);
+    printf("gyro bias %s: %.2f %.2f %.2f dps\n", (ok == true) ? "ok" : "FAILED",
+           (double)s_att.bias_dps[0], (double)s_att.bias_dps[1],
+           (double)s_att.bias_dps[2]);
+    (void)att_run(MAP_HOLD_MS);   /* let the angle settle from accel */
+
+    for (m = 0U; (m < MOTOR_COUNT) && (res == 0U) && (ok == true); m++)
+    {
+        printf("\n[%s] spinning - see WHICH motor it is (write its position down)\n",
+               motor_name[m]);
+        pwm_set_one(m, MAP_DUTY);
+        res = (att_run(MAP_SPIN_MS) == true) ? 1U : 0U;
+        pwm_stop_all();
+
+        if (res == 0U)
+        {
+            printf("[%s] now press THAT motor's corner DOWN ~15-20 deg and hold\n",
+                   motor_name[m]);
+            res = wait_pose(true);
+        }
+        else
+        {
+            /* aborted */
+        }
+
+        if (res == 0U)
+        {
+            roll_s[m]  = sign_when_low(s_att.roll_deg);
+            pitch_s[m] = sign_when_low(s_att.pitch_deg);
+            printf("[%s] corner down: roll %+.1f pitch %+.1f -> roll %+d pitch %+d\n",
+                   motor_name[m], (double)s_att.roll_deg, (double)s_att.pitch_deg,
+                   (int)roll_s[m], (int)pitch_s[m]);
+            printf("    release - back to level\n");
+            res = wait_pose(false);
+        }
+        else
+        {
+            /* aborted or timed out */
+        }
+    }
+
+    pwm_stop_all();
+
+    if (res != 0U)
+    {
+        printf("%s - mapping not finished\n\n", (res == 1U) ? "ABORTED" : "TIMEOUT");
+    }
+    else
+    {
+        /* X quad: diagonal motors share a prop direction, and the
+         * diagonals are the motors with the same roll*pitch product. */
+        for (m = 0U; m < MOTOR_COUNT; m++)
+        {
+            yaw_s[m] = (int8_t)(roll_s[m] * pitch_s[m]);
+            sum_r   += roll_s[m];
+            sum_p   += pitch_s[m];
+        }
+
+        printf("\nmixer_config_t signs (paste into the flight code):\n");
+        print_row("roll", roll_s);
+        print_row("pitch", pitch_s);
+        print_row("yaw", yaw_s);
+
+        if ((sum_r != 0) || (sum_p != 0))
+        {
+            printf("WARNING: roll or pitch signs do not balance (sum %ld / %ld).\n"
+                   "Two motors probably got the same corner - redo the test.\n",
+                   (long)sum_r, (long)sum_p);
+        }
+        else
+        {
+            printf("roll/pitch signs balance - looks like a valid X layout.\n");
+        }
+        printf("yaw: only the diagonal pairing is known. If the drone spins up\n"
+               "faster when yaw control is on, negate the whole yaw row.\n\n");
+    }
+}
+
 /* ================================================================== */
 void app_main(void)
 {
@@ -742,7 +1031,8 @@ void app_main(void)
 
     vTaskDelay(pdMS_TO_TICKS(PHASE_SETTLE_MS));   /* time to open the monitor */
     printf("\n\n%s - PROPS OFF first, drone tied down\n",
-           (RUN_THRUST_TEST == 1U) ? "THRUST test" : "VIBRATION test");
+           (TEST_MODE == TEST_THRUST) ? "THRUST test" :
+           ((TEST_MODE == TEST_MAPPING) ? "MAPPING test" : "VIBRATION test"));
 
     if (mpu_init() == false)
     {
@@ -765,9 +1055,13 @@ void app_main(void)
             if (button_pressed() == true)
             {
                 wait_release();
-                if (RUN_THRUST_TEST == 1U)
+                if (TEST_MODE == TEST_THRUST)
                 {
                     thrust_test();
+                }
+                else if (TEST_MODE == TEST_MAPPING)
+                {
+                    mapping_test();
                 }
                 else
                 {
