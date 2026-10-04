@@ -78,6 +78,13 @@
  * (one spike should not fail the test). */
 #define SIGMA_BAND        (3.0f)
 #define LIMIT_PASS_DPS    (3.0f)
+#define STAGGER_MS        (100U)
+#define SATURATION_DPS    (245.0f)       /* +/-250 dps full scale */
+#define MAX_DEV_DPS       (60.0f)
+#define MIN_SAMPLES_FOR_MEAN (10U)
+/* motors running always add noise; std this close to idle means they
+ * never spun (battery cut-out, wiring), so the result is meaningless */
+#define SPIN_STD_RATIO    (2.0f)
 #define LIMIT_FAIL_DPS    (10.0f)
 #define AXES              (3U)
 
@@ -418,6 +425,42 @@ static float stat_std(const stat_t *s)
 
 /* Sample gyro at 1 kHz (FreeRTOS tick = 1 ms) for duration_ms.
  * Returns true if BOOT was pressed (caller stops the motors). */
+static uint32_t s_read_err = 0U;   /* I2C transfers that failed       */
+static uint32_t s_rejected = 0U;   /* reads that came back corrupted  */
+
+/* A corrupted I2C read (motor EMI) shows up as a full-scale value or a
+ * jump no tied-down frame can make in 1 ms. Real vibration seen so far
+ * stays well inside these limits. */
+static bool sample_is_sane(const stat_t st[AXES], const float g[AXES])
+{
+    bool     ok = true;
+    uint32_t a;
+
+    for (a = 0U; a < AXES; a++)
+    {
+        float v   = g[a];
+        float dev = v - st[a].mean;
+
+        if ((v >= SATURATION_DPS) || (v <= -SATURATION_DPS))
+        {
+            ok = false;
+        }
+        else if ((st[a].n >= MIN_SAMPLES_FOR_MEAN) &&
+                 ((dev > MAX_DEV_DPS) || (dev < -MAX_DEV_DPS)))
+        {
+            ok = false;
+        }
+        else
+        {
+            /* plausible */
+        }
+    }
+
+    return ok;
+}
+
+/* Sample gyro at 1 kHz (FreeRTOS tick = 1 ms) for duration_ms.
+ * Returns true if BOOT was pressed (caller stops the motors). */
 static bool capture(stat_t st[AXES], uint32_t duration_ms)
 {
     TickType_t last    = xTaskGetTickCount();
@@ -431,19 +474,25 @@ static bool capture(stat_t st[AXES], uint32_t duration_ms)
     {
         stat_reset(&st[a]);
     }
+    s_read_err = 0U;
+    s_rejected = 0U;
 
     for (i = 0U; (i < duration_ms) && (aborted == false); i++)
     {
-        if (mpu_read_gyro(g, &az) == true)
+        if (mpu_read_gyro(g, &az) == false)
+        {
+            s_read_err++;
+        }
+        else if (sample_is_sane(st, g) == false)
+        {
+            s_rejected++;
+        }
+        else
         {
             for (a = 0U; a < AXES; a++)
             {
                 stat_add(&st[a], g[a]);
             }
-        }
-        else
-        {
-            /* dropped sample */
         }
         aborted = button_pressed();
         vTaskDelayUntil(&last, 1);
@@ -454,8 +503,8 @@ static bool capture(stat_t st[AXES], uint32_t duration_ms)
 
 static void print_stats(const char *name, const stat_t st[AXES])
 {
-    printf("%-6s n=%4lu | mean %6.2f %6.2f %6.2f | std %5.2f %5.2f %5.2f | p-p %5.2f %5.2f %5.2f\n",
-           name, (unsigned long)st[0].n,
+    printf("%-6s n=%4lu err=%lu bad=%lu | mean %6.2f %6.2f %6.2f | std %5.2f %5.2f %5.2f | p-p %5.2f %5.2f %5.2f\n",
+           name, (unsigned long)st[0].n, (unsigned long)s_read_err, (unsigned long)s_rejected,
            (double)st[0].mean, (double)st[1].mean, (double)st[2].mean,
            (double)stat_std(&st[0]), (double)stat_std(&st[1]), (double)stat_std(&st[2]),
            (double)(st[0].vmax - st[0].vmin), (double)(st[1].vmax - st[1].vmin),
@@ -501,6 +550,25 @@ static bool ramp(uint32_t idx, uint32_t target)
     return aborted;
 }
 
+/* Start motors one at a time so their inrush currents do not add up
+ * (a toy LiPo's protection circuit can trip on the combined surge). */
+static bool ramp_staggered(uint32_t target)
+{
+    uint32_t m;
+    bool     aborted = false;
+
+    /* reverse order (M4 first): if everything still cuts out when the
+     * 4th motor starts, it is total current, not one bad channel */
+    for (m = MOTOR_COUNT; (m > 0U) && (aborted == false); m--)
+    {
+        printf("  start %s\n", motor_name[m - 1U]);
+        aborted = ramp(m - 1U, target);
+        aborted = aborted || wait_abortable(STAGGER_MS);
+    }
+
+    return aborted;
+}
+
 static void verdict(const stat_t idle[AXES], const stat_t run[AXES])
 {
     float    worst = 0.0f;
@@ -519,7 +587,11 @@ static void verdict(const stat_t idle[AXES], const stat_t run[AXES])
            (double)band, (double)stat_std(&idle[0]), (double)stat_std(&idle[1]),
            (double)stat_std(&idle[2]), (unsigned int)DLPF_CFG);
 
-    if (band <= LIMIT_PASS_DPS)
+    if (worst < (SPIN_STD_RATIO * stat_std(&idle[0])))
+    {
+        printf("RESULT: INVALID - std same as idle, motors did not spin\n");
+    }
+    else if (band <= LIMIT_PASS_DPS)
     {
         printf("RESULT: PASS - OK to start PID\n");
     }
@@ -557,8 +629,8 @@ static void vibration_test(void)
     {
         (void)capture(idle, PHASE_MEASURE_MS);   /* motors off - nothing to abort */
         print_stats("idle", idle);
-        printf("[2/3] all motors 40%%\n");
-        aborted = ramp(MOTOR_COUNT, TEST_DUTY);
+        printf("[2/3] all motors 40%% (staggered start)\n");
+        aborted = ramp_staggered(TEST_DUTY);
         aborted = aborted || wait_abortable(PHASE_SETTLE_MS);
     }
     else

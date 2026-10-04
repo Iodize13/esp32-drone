@@ -1,7 +1,7 @@
 """Read the COM port without resetting the board. Usage: readser.py SECONDS"""
 import serial, time, sys
 s = serial.Serial()
-s.port = '/dev/ttyACM0'; s.baudrate = 115200; s.timeout = 0.5
+import glob; s.port = sorted(glob.glob('/dev/ttyACM*'))[0]; s.baudrate = 115200; s.timeout = 0.5
 s.dtr = False; s.rts = False
 s.open()
 end = time.time() + float(sys.argv[1])
