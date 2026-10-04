@@ -1,0 +1,4 @@
+# printf goes to UART0 -> CH343 -> "COM" USB-C port (a real UART, like the Nucleo VCP)
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+# 1 ms tick so the gyro capture loop runs at 1 kHz
+CONFIG_FREERTOS_HZ=1000
