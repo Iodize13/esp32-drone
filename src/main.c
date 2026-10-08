@@ -11,6 +11,8 @@
  *   TEST_MODE TEST_THRUST   : slow ramp 0 -> 100 % to see if it lifts
  *   TEST_MODE TEST_MAPPING  : find where each motor sits, print the
  *                             mixer sign table (PROPS OFF)
+ *   TEST_MODE TEST_PID      : angle PID on the rig (one axis) or
+ *                             tethered (roll + pitch), live tuning
  *
  * Serial: COM port, 115200.
  */
@@ -26,13 +28,17 @@
 #include "driver/ledc.h"
 #include "esp_timer.h"
 #include "esp_rom_sys.h"
+#include "driver/uart.h"
 #include "attitude_filter.h"
+#include "pid.h"
+#include "mixer.h"
 
 /* ------------------------------------------------------------------ */
 #define TEST_VIBRATION    (0U)
 #define TEST_THRUST       (1U)
 #define TEST_MAPPING      (2U)
-#define TEST_MODE         (TEST_MAPPING)
+#define TEST_PID          (3U)
+#define TEST_MODE         (TEST_PID)
 
 #define PIN_SDA           (8)
 #define PIN_SCL           (9)
@@ -776,7 +782,9 @@ static void thrust_test(void)
 #define MAP_BIAS_SAMPLES  (1000U)        /* 1 s still at 1 kHz        */
 #define MAP_TILT_DEG      (8.0f)         /* corner counts as "down"   */
 #define MAP_LEVEL_DEG     (3.0f)         /* back to level             */
-#define MAP_HOLD_MS       (500U)         /* must hold this long       */
+#define MAP_HOLD_MS       (500U)         /* must hold tilt this long  */
+#define MAP_LEVEL_HOLD_MS (1500U)        /* must stay level this long */
+#define MAP_NEXT_PAUSE_MS (1000U)        /* gap before next motor     */
 #define MAP_TIMEOUT_MS    (30000U)
 #define MAP_PRINT_MS      (250U)
 #define ATT_TAU_S         (0.5f)
@@ -785,6 +793,41 @@ static void thrust_test(void)
 #define LOOP_DT_S         (0.001f)
 
 static attitude_t s_att;
+static float      s_ref_roll;        /* resting pose; tilt is      */
+static float      s_ref_pitch;       /* measured from here         */
+
+/* Gyro bias with the frame still, then let the angle settle from the
+ * accel. Returns false if too few samples were read. */
+static bool att_calibrate(void)
+{
+    att_config_t acfg = { ATT_TAU_S, ATT_ACC_MIN_G, ATT_ACC_MAX_G };
+    float        acc[AXES];
+    float        raw[AXES];
+    uint32_t     i;
+    bool         ok;
+
+    att_init(&s_att, &acfg);
+    for (i = 0U; i < MAP_BIAS_SAMPLES; i++)
+    {
+        if (mpu_read_all(acc, raw) == true)
+        {
+            att_bias_add(&s_att, raw);
+        }
+        else
+        {
+            /* skip */
+        }
+        vTaskDelay(1);
+    }
+    ok = att_bias_finish(&s_att, MAP_BIAS_SAMPLES / 2U);
+    printf("gyro bias %s: %.2f %.2f %.2f dps\n", (ok == true) ? "ok" : "FAILED",
+           (double)s_att.bias_dps[0], (double)s_att.bias_dps[1],
+           (double)s_att.bias_dps[2]);
+
+    return ok;
+}
+
+static bool att_run(uint32_t ms);
 
 /* one 1 ms filter step; returns false on read error */
 static bool att_step(void)
@@ -829,7 +872,8 @@ static bool att_run(uint32_t ms)
     return aborted;
 }
 
-/* Wait until want_tilt (corner held down) or level, held MAP_HOLD_MS.
+/* Wait until want_tilt (corner held down, MAP_HOLD_MS) or level
+ * (MAP_LEVEL_HOLD_MS).
  * Returns 0 ok, 1 aborted, 2 timeout. Prints angles while waiting. */
 static uint32_t wait_pose(bool want_tilt)
 {
@@ -837,15 +881,20 @@ static uint32_t wait_pose(bool want_tilt)
     uint32_t   i;
     uint32_t   held   = 0U;
     uint32_t   result = 2U;
+    float      dr;
+    float      dp;
     float      r;
     float      p;
     bool       match;
+    uint32_t   hold_ms = (want_tilt == true) ? MAP_HOLD_MS : MAP_LEVEL_HOLD_MS;
 
     for (i = 0U; (i < MAP_TIMEOUT_MS) && (result == 2U); i++)
     {
         (void)att_step();
-        r = absf(s_att.roll_deg);
-        p = absf(s_att.pitch_deg);
+        dr = s_att.roll_deg  - s_ref_roll;
+        dp = s_att.pitch_deg - s_ref_pitch;
+        r  = absf(dr);
+        p  = absf(dp);
 
         if (want_tilt == true)
         {
@@ -858,7 +907,7 @@ static uint32_t wait_pose(bool want_tilt)
 
         held = (match == true) ? (held + 1U) : 0U;
 
-        if (held >= MAP_HOLD_MS)
+        if (held >= hold_ms)
         {
             result = 0U;
         }
@@ -873,8 +922,7 @@ static uint32_t wait_pose(bool want_tilt)
 
         if ((i % MAP_PRINT_MS) == 0U)
         {
-            printf("    roll %+6.1f  pitch %+6.1f\r", (double)s_att.roll_deg,
-                   (double)s_att.pitch_deg);
+            printf("    d-roll %+6.1f  d-pitch %+6.1f\r", (double)dr, (double)dp);
             (void)fflush(stdout);
         }
         else
@@ -917,38 +965,22 @@ static void print_row(const char *name, const int8_t v[MOTOR_COUNT])
 
 static void mapping_test(void)
 {
-    att_config_t acfg = { ATT_TAU_S, ATT_ACC_MIN_G, ATT_ACC_MAX_G };
     int8_t       roll_s[MOTOR_COUNT]  = { 0, 0, 0, 0 };
     int8_t       pitch_s[MOTOR_COUNT] = { 0, 0, 0, 0 };
     int8_t       yaw_s[MOTOR_COUNT];
     int32_t      sum_r = 0;
     int32_t      sum_p = 0;
     uint32_t     m;
-    uint32_t     i;
     uint32_t     res  = 0U;
-    bool         ok   = true;
-    float        acc[AXES];
-    float        raw[AXES];
+    bool         ok;
 
     printf("MOTOR MAPPING - PROPS OFF. Keep the frame level and still...\n");
-    att_init(&s_att, &acfg);
-    for (i = 0U; i < MAP_BIAS_SAMPLES; i++)
-    {
-        if (mpu_read_all(acc, raw) == true)
-        {
-            att_bias_add(&s_att, raw);
-        }
-        else
-        {
-            /* skip */
-        }
-        vTaskDelay(1);
-    }
-    ok = att_bias_finish(&s_att, MAP_BIAS_SAMPLES / 2U);
-    printf("gyro bias %s: %.2f %.2f %.2f dps\n", (ok == true) ? "ok" : "FAILED",
-           (double)s_att.bias_dps[0], (double)s_att.bias_dps[1],
-           (double)s_att.bias_dps[2]);
+    ok = att_calibrate();
     (void)att_run(MAP_HOLD_MS);   /* let the angle settle from accel */
+    s_ref_roll  = s_att.roll_deg;
+    s_ref_pitch = s_att.pitch_deg;
+    printf("resting pose: roll %+.1f pitch %+.1f (tilt measured from here)\n",
+           (double)s_ref_roll, (double)s_ref_pitch);
 
     for (m = 0U; (m < MOTOR_COUNT) && (res == 0U) && (ok == true); m++)
     {
@@ -971,13 +1003,24 @@ static void mapping_test(void)
 
         if (res == 0U)
         {
-            roll_s[m]  = sign_when_low(s_att.roll_deg);
-            pitch_s[m] = sign_when_low(s_att.pitch_deg);
-            printf("[%s] corner down: roll %+.1f pitch %+.1f -> roll %+d pitch %+d\n",
-                   motor_name[m], (double)s_att.roll_deg, (double)s_att.pitch_deg,
+            roll_s[m]  = sign_when_low(s_att.roll_deg - s_ref_roll);
+            pitch_s[m] = sign_when_low(s_att.pitch_deg - s_ref_pitch);
+            printf("[%s] corner down: d-roll %+.1f d-pitch %+.1f -> roll %+d pitch %+d\n",
+                   motor_name[m], (double)(s_att.roll_deg - s_ref_roll),
+                   (double)(s_att.pitch_deg - s_ref_pitch),
                    (int)roll_s[m], (int)pitch_s[m]);
             printf("    release - back to level\n");
             res = wait_pose(false);
+        }
+        else
+        {
+            /* aborted or timed out */
+        }
+
+        if ((res == 0U) && ((m + 1U) < MOTOR_COUNT))
+        {
+            printf("    level - next motor in %lu ms\n", (unsigned long)MAP_NEXT_PAUSE_MS);
+            res = (att_run(MAP_NEXT_PAUSE_MS) == true) ? 1U : 0U;
         }
         else
         {
@@ -1023,6 +1066,370 @@ static void mapping_test(void)
 }
 
 /* ================================================================== */
+/* Angle PID (PROPS ON)                                                */
+/*                                                                     */
+/* PID_AXES picks what is controlled:                                  */
+/*   PID_AXES_ROLL / PID_AXES_PITCH : single-axis rig - frame on a rod */
+/*       through the CG, free on that axis only. Tune here first.      */
+/*   PID_AXES_BOTH : roll + pitch, drone tethered. Same gains on both  */
+/*       axes (X frame is near symmetric). Yaw is not controlled yet.  */
+/*                                                                     */
+/* Calibrate with the frame still, BOOT starts after a countdown, BOOT */
+/* again = motors off. Live tuning over serial (applies to all axes):  */
+/*   p/P kp -/+   i/I ki -/+   d/D kd -/+   t/T throttle -/+           */
+/*   l / r / c  lean left / lean right / centre (PID_STEP_DEG)         */
+/*              roll; on the pitch rig l = nose up, r = nose down      */
+/*   x   motors off                                                    */
+/*   0   PID off <-> on, gains kept (demo: falls over, then recovers)  */
+/* ================================================================== */
+#define PID_AXES_ROLL     (0U)
+#define PID_AXES_PITCH    (1U)
+#define PID_AXES_BOTH     (2U)
+#define PID_AXES          (PID_AXES_ROLL)
+
+/* angle the IMU reads with the frame level (mapping-test "resting
+ * pose" on a flat table); PID holds this as zero */
+#define TRIM_ROLL_DEG     (0.0f)
+#define TRIM_PITCH_DEG    (-2.5f)
+
+#define PID_KP_START      (2.0f)         /* per-mille per degree        */
+#define PID_KI_START      (0.0f)         /* per-mille per degree-second */
+#define PID_KD_START      (0.2f)         /* per-mille per dps           */
+#define PID_KP_STEP       (0.5f)
+#define PID_KI_STEP       (0.5f)
+#define PID_KD_STEP       (0.05f)
+#define PID_I_LIMIT       (100.0f)       /* per-mille                   */
+#define PID_OUT_LIMIT     (250.0f)       /* per-mille                   */
+#define PID_D_CUTOFF_HZ   (40.0f)
+
+#define PID_THROTTLE      (400U)         /* per-mille base, all motors  */
+#define PID_THR_STEP      (25U)
+#define PID_THR_MAX       (700U)
+#define PID_MAX_DUTY      (850U)
+#define PID_IDLE_DUTY     (60U)          /* keep motors turning         */
+#define PID_SPOOL_MS      (1500U)        /* throttle ramp, no PID yet   */
+#define PID_STEP_DEG      (20.0f)
+#define PID_CUTOFF_DEG    (45.0f)        /* past this: motors off       */
+#define PID_MAX_READ_ERR  (20U)          /* consecutive I2C errors      */
+#define PID_PRINT_MS      (50U)
+#define PID_DT_MIN_S      (0.0002f)
+#define PID_DT_MAX_S      (0.005f)
+#define US_TO_S           (1.0e-6f)
+#define UART_RX_BUF       (256)
+
+/* from the mapping test 2026-10-05: M1 FR, M2 BR, M3 BL, M4 FL */
+static const mixer_config_t s_mix_cfg = {
+    .roll      = { 1, 1, -1, -1 },
+    .pitch     = { 1, -1, -1, 1 },
+    .yaw       = { 1, -1, 1, -1 },       /* direction unverified, unused */
+    .max_duty  = (uint16_t)PID_MAX_DUTY,
+    .idle_duty = (uint16_t)PID_IDLE_DUTY,
+};
+
+static float step_down(float v, float step)
+{
+    return (v > step) ? (v - step) : 0.0f;
+}
+
+static bool s_pid_on = true;
+
+static void pid_print_gains(const pid_config_t *c, uint32_t thr, float sp)
+{
+    printf("\nkp %.2f  ki %.2f  kd %.3f  thr %lu  sp %+.1f  PID %s\n", (double)c->kp,
+           (double)c->ki, (double)c->kd, (unsigned long)thr, (double)sp,
+           (s_pid_on == true) ? "ON" : "OFF");
+}
+
+/* One serial key. Gains are changed in both controllers. Returns true
+ * on 'x' (stop). */
+static bool pid_key(pid_ctrl_t pid[2], uint32_t *thr, float *sp)
+{
+    uint8_t c       = 0U;
+    bool    stop    = false;
+    bool    changed = true;
+    uint32_t a;
+
+    if (uart_read_bytes(UART_NUM_0, &c, 1U, 0) == 1)
+    {
+        for (a = 0U; a < 2U; a++)
+        {
+            pid_config_t *k = &pid[a].cfg;
+
+            switch (c)
+            {
+                case 'P': k->kp += PID_KP_STEP;               break;
+                case 'p': k->kp  = step_down(k->kp, PID_KP_STEP); break;
+                case 'I': k->ki += PID_KI_STEP;               break;
+                case 'i': k->ki  = step_down(k->ki, PID_KI_STEP); break;
+                case 'D': k->kd += PID_KD_STEP;               break;
+                case 'd': k->kd  = step_down(k->kd, PID_KD_STEP); break;
+                default:  /* not a gain key */                break;
+            }
+        }
+
+        switch (c)
+        {
+            case 'P': case 'p': case 'I': case 'i': case 'D': case 'd':
+                break;
+            case 'T':
+                *thr = ((*thr + PID_THR_STEP) > PID_THR_MAX) ? PID_THR_MAX
+                                                             : (*thr + PID_THR_STEP);
+                break;
+            case 't':
+                *thr = (*thr > PID_THR_STEP) ? (*thr - PID_THR_STEP) : 0U;
+                break;
+            case 'l':
+                *sp = PID_STEP_DEG;          /* left side down = +roll */
+                break;
+            case 'r':
+                *sp = -PID_STEP_DEG;
+                break;
+            case 'c':
+                *sp = 0.0f;
+                break;
+            case 'x':
+                stop = true;
+                break;
+            case '0':
+                s_pid_on = (s_pid_on == false);
+                for (a = 0U; a < 2U; a++)
+                {
+                    pid_reset(&pid[a]);     /* no stale I or D on resume */
+                }
+                break;
+            default:
+                changed = false;
+                printf("key 0x%02x ignored\n", (unsigned int)c);
+                break;
+        }
+    }
+    else
+    {
+        changed = false;
+    }
+
+    if (changed == true)
+    {
+        pid_print_gains(&pid[0].cfg, *thr, *sp);
+    }
+    else
+    {
+        /* nothing to report */
+    }
+
+    return stop;
+}
+
+static void pid_test(void)
+{
+    pid_config_t pcfg = { PID_KP_START, PID_KI_START, PID_KD_START,
+                          PID_I_LIMIT, PID_OUT_LIMIT, PID_D_CUTOFF_HZ };
+    pid_ctrl_t   pid[2];                 /* [0] roll, [1] pitch */
+    uint16_t     duty[MOTOR_COUNT] = { 0U, 0U, 0U, 0U };
+    float        acc[AXES];
+    float        raw[AXES];
+    float        g[AXES]   = { 0.0f, 0.0f, 0.0f };
+    float        ang[2]    = { 0.0f, 0.0f };
+    float        corr[2]   = { 0.0f, 0.0f };
+    float        sp        = 0.0f;
+    float        dt;
+    uint32_t     thr_target = PID_THROTTLE;
+    uint32_t     thr;
+    uint32_t     elapsed_ms;
+    uint32_t     err_run   = 0U;
+    uint32_t     loops     = 0U;
+    uint32_t     a;
+    int64_t      now;
+    int64_t      prev;
+    int64_t      t_start;
+    TickType_t   last;
+    bool         stop;
+    const char  *why       = "BOOT";
+    const bool   use_roll  = (PID_AXES != PID_AXES_PITCH);
+    const bool   use_pitch = (PID_AXES != PID_AXES_ROLL);
+
+    printf("ANGLE PID (%s) - PROPS ON, %s, hands clear\n",
+           (PID_AXES == PID_AXES_ROLL) ? "roll rig" :
+           ((PID_AXES == PID_AXES_PITCH) ? "pitch rig" : "roll + pitch"),
+           (PID_AXES == PID_AXES_BOTH) ? "TETHERED" : "frame on the pivot rod");
+    printf("keys: p/P kp  i/I ki  d/D kd  t/T throttle  l/r/c lean  0 PID on/off\n"
+           "      x stop  BOOT stop\n");
+    printf("Hold the frame still for calibration...\n");
+
+    (void)uart_flush_input(UART_NUM_0);  /* drop keys typed while idle */
+
+    stop = (att_calibrate() == false);
+    if (stop == true)
+    {
+        why = "calibration failed";
+    }
+    else
+    {
+        (void)att_run(MAP_HOLD_MS);      /* settle the angle */
+        stop = countdown();
+    }
+
+    for (a = 0U; a < 2U; a++)
+    {
+        pid_init(&pid[a], &pcfg, LOOP_DT_S);
+    }
+    s_pid_on = true;
+    pid_print_gains(&pcfg, thr_target, sp);
+
+    prev    = esp_timer_get_time();
+    t_start = prev;
+    last    = xTaskGetTickCount();
+
+    while (stop == false)
+    {
+        now  = esp_timer_get_time();
+        dt   = (float)(now - prev) * US_TO_S;
+        prev = now;
+        dt   = (dt < PID_DT_MIN_S) ? PID_DT_MIN_S :
+               ((dt > PID_DT_MAX_S) ? PID_DT_MAX_S : dt);
+
+        if (mpu_read_all(acc, raw) == true)
+        {
+            err_run = 0U;
+            att_unbias(&s_att, raw, g);
+            att_update(&s_att, acc, g, dt);
+        }
+        else
+        {
+            err_run++;                   /* keep the last angle and rate */
+        }
+
+        ang[0] = s_att.roll_deg  - TRIM_ROLL_DEG;
+        ang[1] = s_att.pitch_deg - TRIM_PITCH_DEG;
+
+        elapsed_ms = (uint32_t)((now - t_start) / US_PER_MS);
+        if ((elapsed_ms >= PID_SPOOL_MS) && (s_pid_on == false))
+        {
+            thr     = thr_target;            /* demo: throttle only */
+            corr[0] = 0.0f;
+            corr[1] = 0.0f;
+        }
+        else if (elapsed_ms < PID_SPOOL_MS)
+        {
+            /* spool up with no correction, so I does not wind up while
+             * the motors are still too slow to respond */
+            thr = (thr_target * elapsed_ms) / PID_SPOOL_MS;
+            thr = (thr == 0U) ? 1U : thr;
+            corr[0] = 0.0f;
+            corr[1] = 0.0f;
+        }
+        else
+        {
+            thr     = thr_target;
+            corr[0] = (use_roll == true)
+                    ? pid_update(&pid[0], sp, ang[0], g[0], dt) : 0.0f;
+            corr[1] = (use_pitch == true)
+                    ? pid_update(&pid[1], (use_roll == true) ? 0.0f : sp,
+                                 ang[1], g[1], dt) : 0.0f;
+        }
+
+        mixer_mix(&s_mix_cfg, (uint16_t)thr, corr[0], corr[1], 0.0f, duty);
+        for (a = 0U; a < MOTOR_COUNT; a++)
+        {
+            pwm_set_one(a, duty[a]);
+        }
+
+        if (((use_roll == true) && (absf(ang[0]) > PID_CUTOFF_DEG)) ||
+            ((use_pitch == true) && (absf(ang[1]) > PID_CUTOFF_DEG)))
+        {
+            stop = true;
+            why  = "angle limit";
+        }
+        else if (err_run >= PID_MAX_READ_ERR)
+        {
+            stop = true;
+            why  = "I2C errors";
+        }
+        else if (button_pressed() == true)
+        {
+            stop = true;
+            why  = "BOOT";
+        }
+        else if (pid_key(pid, &thr_target, &sp) == true)
+        {
+            stop = true;
+            why  = "x key";
+        }
+        else
+        {
+            /* keep flying */
+        }
+
+        if ((loops % PID_PRINT_MS) == 0U)
+        {
+            a = (use_roll == true) ? 0U : 1U;    /* axis shown in the log */
+            printf("%s %+6.1f sp %+5.1f rate %+7.1f P %+5.0f I %+5.0f D %+5.0f"
+                   " M %3u %3u %3u %3u\n", (a == 0U) ? "R" : "P",
+                   (double)ang[a], (double)sp, (double)g[a],
+                   (double)pid[a].last_p, (double)pid[a].last_i,
+                   (double)pid[a].last_d, (unsigned int)duty[0],
+                   (unsigned int)duty[1], (unsigned int)duty[2],
+                   (unsigned int)duty[3]);
+            if (PID_AXES == PID_AXES_BOTH)
+            {
+                printf("P %+6.1f rate %+7.1f P %+5.0f I %+5.0f D %+5.0f\n",
+                       (double)ang[1], (double)g[1], (double)pid[1].last_p,
+                       (double)pid[1].last_i, (double)pid[1].last_d);
+            }
+            else
+            {
+                /* single axis */
+            }
+        }
+        else
+        {
+            /* not a print step */
+        }
+        loops++;
+        vTaskDelayUntil(&last, 1);
+    }
+
+    pwm_stop_all();
+    printf("\nMOTORS OFF (%s)\n", why);
+    pid_print_gains(&pid[0].cfg, thr_target, sp);
+    printf("\n");
+}
+
+/* UART0 RX driver for the live-tuning keys. Installed at boot so a
+ * typed key can be checked before the motors run. */
+static bool keys_init(void)
+{
+    esp_err_t err = ESP_OK;
+
+    if (uart_is_driver_installed(UART_NUM_0) == false)
+    {
+        err = uart_driver_install(UART_NUM_0, UART_RX_BUF, 0, 0, NULL, 0);
+    }
+    else
+    {
+        /* already installed */
+    }
+    return (err == ESP_OK);
+}
+
+/* While idle, answer every key so the serial link can be checked with
+ * the motors off. */
+static void keys_echo_idle(void)
+{
+    uint8_t c = 0U;
+
+    if (uart_read_bytes(UART_NUM_0, &c, 1U, 0) == 1)
+    {
+        printf("key '%c' received - motors off, press BOOT to start\n",
+               ((c >= (uint8_t)' ') && (c <= (uint8_t)'~')) ? (char)c : '?');
+    }
+    else
+    {
+        /* no key */
+    }
+}
+
+/* ================================================================== */
 void app_main(void)
 {
     pwm_init();
@@ -1032,7 +1439,8 @@ void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(PHASE_SETTLE_MS));   /* time to open the monitor */
     printf("\n\n%s - PROPS OFF first, drone tied down\n",
            (TEST_MODE == TEST_THRUST) ? "THRUST test" :
-           ((TEST_MODE == TEST_MAPPING) ? "MAPPING test" : "VIBRATION test"));
+           ((TEST_MODE == TEST_MAPPING) ? "MAPPING test" :
+           ((TEST_MODE == TEST_PID) ? "PID test" : "VIBRATION test")));
 
     if (mpu_init() == false)
     {
@@ -1047,8 +1455,18 @@ void app_main(void)
         printf("ready - press BOOT to start\n");
     }
 
+    if (keys_init() == false)
+    {
+        printf("UART0 RX driver failed - keys will not work\n");
+    }
+    else
+    {
+        /* keys ready */
+    }
+
     for (;;)
     {
+        keys_echo_idle();
         if (button_pressed() == true)
         {
             vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS));
@@ -1062,6 +1480,10 @@ void app_main(void)
                 else if (TEST_MODE == TEST_MAPPING)
                 {
                     mapping_test();
+                }
+                else if (TEST_MODE == TEST_PID)
+                {
+                    pid_test();
                 }
                 else
                 {
