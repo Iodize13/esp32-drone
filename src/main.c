@@ -32,6 +32,7 @@
 #include "attitude_filter.h"
 #include "pid.h"
 #include "mixer.h"
+#include "adc_batt.h"
 
 /* ------------------------------------------------------------------ */
 #define TEST_VIBRATION    (0U)
@@ -51,6 +52,9 @@
 #define REG_CONFIG        (0x1AU)
 #define REG_GYRO_CONFIG   (0x1BU)
 #define REG_ACCEL_CONFIG  (0x1CU)
+#define REG_ACCEL_CONFIG2 (0x1DU)        /* MPU6500 only: accel DLPF */
+#define ACCEL_FS_8G       (0x10U)
+#define ACCEL_DLPF_10HZ   (0x05U)
 #define REG_ACCEL_XOUT_H  (0x3BU)
 #define REG_PWR_MGMT_1    (0x6BU)
 #define REG_WHO_AM_I      (0x75U)
@@ -60,7 +64,7 @@
 
 #define DLPF_CFG          (0x04U)        /* 0x03=41 Hz, 0x04=20 Hz, 0x05=10 Hz */
 #define SMPLRT_DIV_1KHZ   (0x00U)
-#define ACCEL_LSB_PER_G   (16384.0f)
+#define ACCEL_LSB_PER_G   (4096.0f)       /* +/-8 g */
 #define GYRO_LSB_PER_DPS  (131.0f)
 
 #define MOTOR_COUNT       (4U)
@@ -372,7 +376,19 @@ static bool mpu_init(void)
         ok = ok && mpu_write(REG_CONFIG, (uint8_t)DLPF_CFG);
         ok = ok && mpu_write(REG_SMPLRT_DIV, (uint8_t)SMPLRT_DIV_1KHZ);
         ok = ok && mpu_write(REG_GYRO_CONFIG, 0x00U);            /* 250 dps */
-        ok = ok && mpu_write(REG_ACCEL_CONFIG, 0x00U);           /* 2 g     */
+        /* 8 g so prop vibration does not clip, and a 10 Hz accel DLPF:
+         * CONFIG (0x1A) only filters the gyro on the MPU6500, so without
+         * this the accel runs at 460 Hz and vibration aliases into a
+         * false tilt of ~15 deg with the motors on */
+        ok = ok && mpu_write(REG_ACCEL_CONFIG, (uint8_t)ACCEL_FS_8G);
+        if (who == WHO_MPU6500)
+        {
+            ok = ok && mpu_write(REG_ACCEL_CONFIG2, (uint8_t)ACCEL_DLPF_10HZ);
+        }
+        else
+        {
+            /* MPU6050: CONFIG already filters accel and gyro */
+        }
         vTaskDelay(pdMS_TO_TICKS(100U));
     }
 
@@ -798,7 +814,14 @@ static float      s_ref_pitch;       /* measured from here         */
 
 /* Gyro bias with the frame still, then let the angle settle from the
  * accel. Returns false if too few samples were read. */
-static bool att_calibrate(void)
+/* A still MPU6500 shows a few dps of bias. More than this means the
+ * frame was swinging during calibration, which would make the angle
+ * drift at that rate for the whole run. */
+#define CAL_BIAS_MAX_DPS  (10.0f)
+#define CAL_TRIES         (5U)
+#define CAL_RETRY_MS      (500U)
+
+static bool att_calibrate_once(void)
 {
     att_config_t acfg = { ATT_TAU_S, ATT_ACC_MIN_G, ATT_ACC_MAX_G };
     float        acc[AXES];
@@ -820,9 +843,44 @@ static bool att_calibrate(void)
         vTaskDelay(1);
     }
     ok = att_bias_finish(&s_att, MAP_BIAS_SAMPLES / 2U);
-    printf("gyro bias %s: %.2f %.2f %.2f dps\n", (ok == true) ? "ok" : "FAILED",
+    for (i = 0U; i < AXES; i++)
+    {
+        if (fabsf(s_att.bias_dps[i]) > CAL_BIAS_MAX_DPS)
+        {
+            ok = false;                  /* frame was moving */
+        }
+        else
+        {
+            /* plausible bias */
+        }
+    }
+    printf("gyro bias %s: %.2f %.2f %.2f dps\n",
+           (ok == true) ? "ok" : "REJECTED (frame moving?)",
            (double)s_att.bias_dps[0], (double)s_att.bias_dps[1],
            (double)s_att.bias_dps[2]);
+
+    return ok;
+}
+
+/* Retry until the frame holds still, so a swing after BOOT does not
+ * spoil the whole run. */
+static bool att_calibrate(void)
+{
+    bool     ok = false;
+    uint32_t n;
+
+    for (n = 0U; (n < CAL_TRIES) && (ok == false); n++)
+    {
+        ok = att_calibrate_once();
+        if (ok == false)
+        {
+            vTaskDelay(pdMS_TO_TICKS(CAL_RETRY_MS));
+        }
+        else
+        {
+            /* calibrated */
+        }
+    }
 
     return ok;
 }
@@ -1092,13 +1150,13 @@ static void mapping_test(void)
 #define TRIM_ROLL_DEG     (0.0f)
 #define TRIM_PITCH_DEG    (-2.5f)
 
-#define PID_KP_START      (2.0f)         /* per-mille per degree        */
-#define PID_KI_START      (0.0f)         /* per-mille per degree-second */
-#define PID_KD_START      (0.2f)         /* per-mille per dps           */
+#define PID_KP_START      (8.0f)         /* per-mille per degree        */
+#define PID_KI_START      (1.0f)         /* per-mille per degree-second */
+#define PID_KD_START      (0.7f)         /* per-mille per dps           */
 #define PID_KP_STEP       (0.5f)
 #define PID_KI_STEP       (0.5f)
 #define PID_KD_STEP       (0.05f)
-#define PID_I_LIMIT       (100.0f)       /* per-mille                   */
+#define PID_I_LIMIT       (50.0f)        /* per-mille                   */
 #define PID_OUT_LIMIT     (250.0f)       /* per-mille                   */
 #define PID_D_CUTOFF_HZ   (40.0f)
 
@@ -1108,7 +1166,7 @@ static void mapping_test(void)
 #define PID_MAX_DUTY      (850U)
 #define PID_IDLE_DUTY     (60U)          /* keep motors turning         */
 #define PID_SPOOL_MS      (1500U)        /* throttle ramp, no PID yet   */
-#define PID_STEP_DEG      (20.0f)
+#define PID_STEP_DEG      (10.0f)
 #define PID_CUTOFF_DEG    (45.0f)        /* past this: motors off       */
 #define PID_MAX_READ_ERR  (20U)          /* consecutive I2C errors      */
 #define PID_PRINT_MS      (50U)
@@ -1138,6 +1196,28 @@ static void pid_print_gains(const pid_config_t *c, uint32_t thr, float sp)
     printf("\nkp %.2f  ki %.2f  kd %.3f  thr %lu  sp %+.1f  PID %s\n", (double)c->kp,
            (double)c->ki, (double)c->kd, (unsigned long)thr, (double)sp,
            (s_pid_on == true) ? "ON" : "OFF");
+}
+
+/* Battery divider: 100k / 100k, so battery = pin * 2. Check with the
+ * 'b' key against a meter on BATT+ (an analog meter loads a 100k divider
+ * and reads low at the midpoint - measure BATT+ only). */
+#define BATT_DIV_RATIO    (2.0f)
+
+/* Battery voltage in mV, 0 if the ADC has no data yet. */
+static uint32_t batt_mv(void)
+{
+    uint32_t pin = 0U;
+    uint32_t out = 0U;
+
+    if (adc_batt_pin_mv(&pin) == true)
+    {
+        out = (uint32_t)(((float)pin * BATT_DIV_RATIO) + 0.5f);
+    }
+    else
+    {
+        /* no data */
+    }
+    return out;
 }
 
 /* One serial key. Gains are changed in both controllers. Returns true
@@ -1364,12 +1444,12 @@ static void pid_test(void)
         {
             a = (use_roll == true) ? 0U : 1U;    /* axis shown in the log */
             printf("%s %+6.1f sp %+5.1f rate %+7.1f P %+5.0f I %+5.0f D %+5.0f"
-                   " M %3u %3u %3u %3u\n", (a == 0U) ? "R" : "P",
+                   " M %3u %3u %3u %3u B %4lu\n", (a == 0U) ? "R" : "P",
                    (double)ang[a], (double)sp, (double)g[a],
                    (double)pid[a].last_p, (double)pid[a].last_i,
                    (double)pid[a].last_d, (unsigned int)duty[0],
                    (unsigned int)duty[1], (unsigned int)duty[2],
-                   (unsigned int)duty[3]);
+                   (unsigned int)duty[3], (unsigned long)batt_mv());
             if (PID_AXES == PID_AXES_BOTH)
             {
                 printf("P %+6.1f rate %+7.1f P %+5.0f I %+5.0f D %+5.0f\n",
@@ -1412,6 +1492,70 @@ static bool keys_init(void)
     return (err == ESP_OK);
 }
 
+/* 'a' while idle: accel-only roll/pitch, averaged, with the PID trim
+ * applied. Hold the frame physically level to read the trim needed. */
+#define LEVEL_SAMPLES     (200U)
+#define LEVEL_RAD_TO_DEG  (57.29578f)
+
+static void level_print(void)
+{
+    float    acc[AXES];
+    float    raw[AXES];
+    float    sum[AXES] = { 0.0f, 0.0f, 0.0f };
+    uint32_t n = 0U;
+    uint32_t i;
+    uint32_t k;
+
+    for (i = 0U; i < LEVEL_SAMPLES; i++)
+    {
+        if (mpu_read_all(acc, raw) == true)
+        {
+            for (k = 0U; k < AXES; k++)
+            {
+                sum[k] += acc[k];
+            }
+            n++;
+        }
+        else
+        {
+            /* skip a bad read */
+        }
+        vTaskDelay(1);
+    }
+
+    if (n > 0U)
+    {
+        float roll  = atan2f(sum[1], sum[2]) * LEVEL_RAD_TO_DEG;
+        float pitch = atan2f(-sum[0], sqrtf((sum[1] * sum[1]) +
+                                            (sum[2] * sum[2]))) * LEVEL_RAD_TO_DEG;
+        printf("level: roll %+.1f pitch %+.1f (raw)  ->  roll %+.1f pitch %+.1f"
+               " (after trim)\n", (double)roll, (double)pitch,
+               (double)(roll - TRIM_ROLL_DEG), (double)(pitch - TRIM_PITCH_DEG));
+    }
+    else
+    {
+        printf("level: IMU read failed\n");
+    }
+}
+
+/* 'b' while idle: pin and battery voltage, to check BATT_DIV_RATIO
+ * against a multimeter on BATT+. */
+static void batt_print(void)
+{
+    uint32_t pin = 0U;
+
+    if (adc_batt_pin_mv(&pin) == true)
+    {
+        printf("battery: pin %lu mV -> battery %lu mV (ratio %.3f)\n",
+               (unsigned long)pin, (unsigned long)batt_mv(),
+               (double)BATT_DIV_RATIO);
+    }
+    else
+    {
+        printf("battery: no ADC data\n");
+    }
+}
+
 /* While idle, answer every key so the serial link can be checked with
  * the motors off. */
 static void keys_echo_idle(void)
@@ -1420,8 +1564,19 @@ static void keys_echo_idle(void)
 
     if (uart_read_bytes(UART_NUM_0, &c, 1U, 0) == 1)
     {
-        printf("key '%c' received - motors off, press BOOT to start\n",
-               ((c >= (uint8_t)' ') && (c <= (uint8_t)'~')) ? (char)c : '?');
+        switch (c)
+        {
+            case 'a':
+                level_print();
+                break;
+            case 'b':
+                batt_print();
+                break;
+            default:
+                printf("key '%c' received - motors off, press BOOT to start\n",
+                       ((c >= (uint8_t)' ') && (c <= (uint8_t)'~')) ? (char)c : '?');
+                break;
+        }
     }
     else
     {
@@ -1462,6 +1617,15 @@ void app_main(void)
     else
     {
         /* keys ready */
+    }
+
+    if (adc_batt_init() == false)
+    {
+        printf("battery ADC init failed\n");
+    }
+    else
+    {
+        printf("battery ADC on GPIO1 - press 'b' to read\n");
     }
 
     for (;;)
