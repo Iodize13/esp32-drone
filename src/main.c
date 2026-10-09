@@ -1214,6 +1214,14 @@ static void pid_print_gains(const pid_config_t *c, uint32_t thr, float sp)
  * and reads low at the midpoint - measure BATT+ only). */
 #define BATT_DIV_RATIO    (2.0f)
 
+/* 1S LiPo limits. Under load the voltage sags ~0.3-0.5 V, so the
+ * in-flight cut is lower than the start check and must last a while. */
+#define BATT_START_MIN_MV (3600U)        /* refuse to start below this  */
+#define BATT_WARN_MV      (3500U)        /* print a warning once        */
+#define BATT_CUT_MV       (3200U)        /* motors off below this ...   */
+#define BATT_CUT_S        (1.0f)         /* ... for this long           */
+#define BATT_GLITCH_MV    (5000U)        /* impossible for 1S: ignore   */
+
 /* Battery voltage in mV, 0 if the ADC has no data yet. */
 static uint32_t batt_mv(void)
 {
@@ -1336,7 +1344,10 @@ static void pid_test(void)
     int64_t      prev;
     int64_t      t_start;
     uint32_t     int_miss  = 0U;
-    bool         stop;
+    uint32_t     bat;
+    float        bat_low_s = 0.0f;
+    bool         bat_warned = false;
+    bool         stop      = false;
     const char  *why       = "BOOT";
     const bool   use_roll  = (PID_AXES != PID_AXES_PITCH);
     const bool   use_pitch = (PID_AXES != PID_AXES_ROLL);
@@ -1351,10 +1362,18 @@ static void pid_test(void)
 
     (void)uart_flush_input(UART_NUM_0);  /* drop keys typed while idle */
 
-    stop = (att_calibrate() == false);
-    if (stop == true)
+    bat = batt_mv();
+    if ((bat > 0U) && (bat < BATT_START_MIN_MV))
     {
-        why = "calibration failed";
+        stop = true;
+        why  = "battery low - charge it";
+        printf("battery %lu mV < %u mV\n", (unsigned long)bat,
+               (unsigned int)BATT_START_MIN_MV);
+    }
+    else if (att_calibrate() == false)
+    {
+        stop = true;
+        why  = "calibration failed";
     }
     else
     {
@@ -1410,6 +1429,31 @@ static void pid_test(void)
             sp = sp_cmd;
         }
 
+        /* battery: warn once, cut only if it stays low (a short sag
+         * while the motors speed up is normal) */
+        bat = batt_mv();
+        if ((bat > 0U) && (bat < BATT_CUT_MV))
+        {
+            bat_low_s += dt;
+        }
+        else if ((bat > 0U) && (bat < BATT_GLITCH_MV))
+        {
+            bat_low_s = 0.0f;
+        }
+        else
+        {
+            /* no data or ADC glitch - keep the timer as is */
+        }
+        if ((bat > 0U) && (bat < BATT_WARN_MV) && (bat_warned == false))
+        {
+            bat_warned = true;
+            printf("WARNING battery %lu mV - land soon\n", (unsigned long)bat);
+        }
+        else
+        {
+            /* fine, or already warned */
+        }
+
         elapsed_ms = (uint32_t)((now - t_start) / US_PER_MS);
         if ((elapsed_ms >= PID_SPOOL_MS) && (s_pid_on == false))
         {
@@ -1452,6 +1496,11 @@ static void pid_test(void)
         {
             stop = true;
             why  = "I2C errors";
+        }
+        else if (bat_low_s >= BATT_CUT_S)
+        {
+            stop = true;
+            why  = "battery low";
         }
         else if (button_pressed() == true)
         {
