@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live plot for TEST_PID: angle vs setpoint, P/I/D terms, motor duty.
+"""Live plot for TEST_PID: angle vs setpoint, P/I/D terms, motor duty, battery.
 
 Keys typed in the plot window go straight to the drone (same keys as the
 serial monitor): p/P i/I d/D t/T l r c 0 x. BOOT on the board still
@@ -23,18 +23,19 @@ from matplotlib.animation import FuncAnimation
 PORT = sys.argv[1] if len(sys.argv) > 1 else "/dev/ttyACM0"
 BAUD = 115200
 WINDOW_S = 15.0
-KEYS = set("pPiIdDtTlrc0x")
+KEYS = set("pPiIdDtTlrc0xab")    # a, b: level and battery while idle
 
 NUM = r"([+-]?\d+(?:\.\d+)?)"
 LOG_RE = re.compile(
     rf"^([RP])\s+{NUM}\s+sp\s+{NUM}\s+rate\s+{NUM}\s+P\s+{NUM}\s+I\s+{NUM}"
-    rf"\s+D\s+{NUM}\s+M\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)"
+    rf"\s+D\s+{NUM}\s+M\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)(?:\s+B\s+(\d+))?"
 )
+BATT_MAX_MV = 5000                  # 1S cannot exceed this: ADC glitch
 GAIN_RE = re.compile(
     rf"kp\s+{NUM}\s+ki\s+{NUM}\s+kd\s+{NUM}\s+thr\s+(\d+)\s+sp\s+{NUM}\s+PID\s+(\w+)"
 )
 
-data = {k: deque() for k in ("t", "ang", "sp", "p", "i", "d", "m1", "m2", "m3", "m4")}
+data = {k: deque() for k in ("t", "ang", "sp", "p", "i", "d", "m1", "m2", "m3", "m4", "bat")}
 events = deque()                    # (time, label) for gain / mode changes
 state = {"gains": "waiting for data - press BOOT on the board", "axis": "R"}
 lock = threading.Lock()
@@ -70,11 +71,15 @@ def reader():
             with lock:
                 if m:
                     state["axis"] = m.group(1)
-                    vals = [float(x) for x in m.groups()[1:]]
+                    vals = [float(x) for x in m.groups()[1:11]]
                     for key, v in zip(("ang", "sp", None, "p", "i", "d",
                                        "m1", "m2", "m3", "m4"), vals):
                         if key:
                             data[key].append(v)
+                    v = float(m.group(12)) / 1000.0 if m.group(12) else float("nan")
+                    if v > BATT_MAX_MV / 1000.0:        # glitch: hold last
+                        v = data["bat"][-1] if data["bat"] else float("nan")
+                    data["bat"].append(v)
                     data["t"].append(now)
                     while data["t"] and data["t"][0] < now - WINDOW_S:
                         for q in data.values():
@@ -114,8 +119,9 @@ for name in list(plt.rcParams):
     if name.startswith("keymap."):
         plt.rcParams[name] = []
 
-fig, (ax_a, ax_pid, ax_m) = plt.subplots(
-    3, 1, sharex=True, figsize=(11, 8), gridspec_kw={"height_ratios": [3, 1.4, 1.4]})
+fig, (ax_a, ax_pid, ax_m, ax_b) = plt.subplots(
+    4, 1, sharex=True, figsize=(11, 9),
+    gridspec_kw={"height_ratios": [3, 1.4, 1.4, 0.9]})
 line_sp, = ax_a.plot([], [], "--", color="tab:gray", lw=2, label="setpoint (command)")
 line_ang, = ax_a.plot([], [], color="tab:blue", lw=2, label="measured angle")
 ax_a.set_ylabel("angle (deg)")
@@ -132,9 +138,16 @@ ax_pid.legend(loc="upper left", ncol=3)
 line_left, = ax_m.plot([], [], color="tab:green", label="left motors M3/M4")
 line_right, = ax_m.plot([], [], color="tab:red", label="right motors M1/M2")
 ax_m.set_ylabel("duty\n(per-mille)")
-ax_m.set_xlabel("time (s)")
 ax_m.set_ylim(0, 1000)
 ax_m.legend(loc="upper left", ncol=2)
+
+line_bat, = ax_b.plot([], [], color="tab:purple", label="battery")
+ax_b.axhline(3.5, color="tab:red", lw=0.8, ls=":")    # 1S low under load
+ax_b.set_ylabel("battery\n(V)")
+ax_b.set_xlabel("time (s)")
+ax_b.set_ylim(3.0, 4.4)
+bat_text = ax_b.text(0.99, 0.85, "", transform=ax_b.transAxes, ha="right",
+                     va="top", fontsize=10, color="tab:purple")
 
 title = fig.suptitle("", fontsize=13)
 fig.text(0.01, 0.005, "keys: P/p kp  D/d kd  I/i ki  T/t throttle  "
@@ -165,6 +178,9 @@ def update(_frame):
     line_d.set_data(t, cols["d"])
     line_left.set_data(t, [(a + b) / 2 for a, b in zip(cols["m3"], cols["m4"])])
     line_right.set_data(t, [(a + b) / 2 for a, b in zip(cols["m1"], cols["m2"])])
+    line_bat.set_data(t, cols["bat"])
+    bat_text.set_text(f"{cols['bat'][-1]:.2f} V" if cols["bat"][-1] == cols["bat"][-1]
+                      else "no battery data")
     ax_a.set_xlim(max(t[-1] - WINDOW_S, 0), max(t[-1], WINDOW_S))
     ax_a.set_ylabel("roll (deg)" if state["axis"] == "R" else "pitch (deg)")
     span = max([abs(v) for v in cols["p"] + cols["i"] + cols["d"]] + [20])

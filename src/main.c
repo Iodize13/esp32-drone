@@ -33,6 +33,7 @@
 #include "pid.h"
 #include "mixer.h"
 #include "adc_batt.h"
+#include "imu_int.h"
 
 /* ------------------------------------------------------------------ */
 #define TEST_VIBRATION    (0U)
@@ -55,6 +56,9 @@
 #define REG_ACCEL_CONFIG2 (0x1DU)        /* MPU6500 only: accel DLPF */
 #define ACCEL_FS_8G       (0x10U)
 #define ACCEL_DLPF_10HZ   (0x05U)
+#define REG_INT_PIN_CFG   (0x37U)
+#define REG_INT_ENABLE    (0x38U)
+#define REG_INT_STATUS    (0x3AU)
 #define REG_ACCEL_XOUT_H  (0x3BU)
 #define REG_PWR_MGMT_1    (0x6BU)
 #define REG_WHO_AM_I      (0x75U)
@@ -64,6 +68,8 @@
 
 #define DLPF_CFG          (0x04U)        /* 0x03=41 Hz, 0x04=20 Hz, 0x05=10 Hz */
 #define SMPLRT_DIV_1KHZ   (0x00U)
+#define INT_PIN_PULSE_HI  (0x30U)        /* active high, push-pull, latched until any read */
+#define INT_RAW_RDY_EN    (0x01U)        /* INT on every new sample            */
 #define ACCEL_LSB_PER_G   (4096.0f)       /* +/-8 g */
 #define GYRO_LSB_PER_DPS  (131.0f)
 
@@ -389,6 +395,9 @@ static bool mpu_init(void)
         {
             /* MPU6050: CONFIG already filters accel and gyro */
         }
+        /* data-ready on the INT pin -> EXTI on GPIO10 */
+        ok = ok && mpu_write(REG_INT_PIN_CFG, (uint8_t)INT_PIN_PULSE_HI);
+        ok = ok && mpu_write(REG_INT_ENABLE, (uint8_t)INT_RAW_RDY_EN);
         vTaskDelay(pdMS_TO_TICKS(100U));
     }
 
@@ -1150,9 +1159,9 @@ static void mapping_test(void)
 #define TRIM_ROLL_DEG     (0.0f)
 #define TRIM_PITCH_DEG    (-2.5f)
 
-#define PID_KP_START      (8.0f)         /* per-mille per degree        */
-#define PID_KI_START      (1.0f)         /* per-mille per degree-second */
-#define PID_KD_START      (0.7f)         /* per-mille per dps           */
+#define PID_KP_START      (12.0f)        /* per-mille per degree        */
+#define PID_KI_START      (7.0f)         /* per-mille per degree-second */
+#define PID_KD_START      (2.0f)         /* per-mille per dps           */
 #define PID_KP_STEP       (0.5f)
 #define PID_KI_STEP       (0.5f)
 #define PID_KD_STEP       (0.05f)
@@ -1166,10 +1175,12 @@ static void mapping_test(void)
 #define PID_MAX_DUTY      (850U)
 #define PID_IDLE_DUTY     (60U)          /* keep motors turning         */
 #define PID_SPOOL_MS      (1500U)        /* throttle ramp, no PID yet   */
-#define PID_STEP_DEG      (10.0f)
+#define PID_STEP_DEG      (20.0f)
+#define PID_SP_RATE_DPS   (20.0f)        /* setpoint ramp, deg per s    */
 #define PID_CUTOFF_DEG    (45.0f)        /* past this: motors off       */
 #define PID_MAX_READ_ERR  (20U)          /* consecutive I2C errors      */
 #define PID_PRINT_MS      (50U)
+#define PID_INT_WAIT_MS   (2U)           /* > 1 ms sample period        */
 #define PID_DT_MIN_S      (0.0002f)
 #define PID_DT_MAX_S      (0.005f)
 #define US_TO_S           (1.0e-6f)
@@ -1311,7 +1322,9 @@ static void pid_test(void)
     float        g[AXES]   = { 0.0f, 0.0f, 0.0f };
     float        ang[2]    = { 0.0f, 0.0f };
     float        corr[2]   = { 0.0f, 0.0f };
-    float        sp        = 0.0f;
+    float        sp        = 0.0f;       /* ramped, fed to the PID      */
+    float        sp_cmd    = 0.0f;       /* target set by l / r / c     */
+    float        sp_step;
     float        dt;
     uint32_t     thr_target = PID_THROTTLE;
     uint32_t     thr;
@@ -1322,7 +1335,7 @@ static void pid_test(void)
     int64_t      now;
     int64_t      prev;
     int64_t      t_start;
-    TickType_t   last;
+    uint32_t     int_miss  = 0U;
     bool         stop;
     const char  *why       = "BOOT";
     const bool   use_roll  = (PID_AXES != PID_AXES_PITCH);
@@ -1358,7 +1371,6 @@ static void pid_test(void)
 
     prev    = esp_timer_get_time();
     t_start = prev;
-    last    = xTaskGetTickCount();
 
     while (stop == false)
     {
@@ -1381,6 +1393,22 @@ static void pid_test(void)
 
         ang[0] = s_att.roll_deg  - TRIM_ROLL_DEG;
         ang[1] = s_att.pitch_deg - TRIM_PITCH_DEG;
+
+        /* move the setpoint toward the command at a fixed rate: a 10 deg
+         * jump made P kick hard and overshoot by ~5 deg */
+        sp_step = PID_SP_RATE_DPS * dt;
+        if ((sp_cmd - sp) > sp_step)
+        {
+            sp += sp_step;
+        }
+        else if ((sp - sp_cmd) > sp_step)
+        {
+            sp -= sp_step;
+        }
+        else
+        {
+            sp = sp_cmd;
+        }
 
         elapsed_ms = (uint32_t)((now - t_start) / US_PER_MS);
         if ((elapsed_ms >= PID_SPOOL_MS) && (s_pid_on == false))
@@ -1430,7 +1458,7 @@ static void pid_test(void)
             stop = true;
             why  = "BOOT";
         }
-        else if (pid_key(pid, &thr_target, &sp) == true)
+        else if (pid_key(pid, &thr_target, &sp_cmd) == true)
         {
             stop = true;
             why  = "x key";
@@ -1466,11 +1494,24 @@ static void pid_test(void)
             /* not a print step */
         }
         loops++;
-        vTaskDelayUntil(&last, 1);
+
+        /* pace the loop on the IMU data-ready interrupt; a timeout means
+         * INT is not wired, and the loop then runs every PID_INT_WAIT_MS */
+        if (imu_int_wait(PID_INT_WAIT_MS) == false)
+        {
+            int_miss++;
+        }
+        else
+        {
+            /* new sample ready */
+        }
     }
 
     pwm_stop_all();
     printf("\nMOTORS OFF (%s)\n", why);
+    printf("EXTI: %lu loops, %lu without data-ready (%s)\n",
+           (unsigned long)loops, (unsigned long)int_miss,
+           (int_miss > (loops / 2U)) ? "INT NOT WORKING - check GPIO10 wire" : "ok");
     pid_print_gains(&pid[0].cfg, thr_target, sp);
     printf("\n");
 }
@@ -1556,6 +1597,28 @@ static void batt_print(void)
     }
 }
 
+/* 'i' while idle: count data-ready edges over 100 ms; ~100 means the
+ * INT wire to GPIO10 works. */
+#define INT_CHECK_MS      (100U)
+
+static void int_print(void)
+{
+    uint8_t  st = 0U;
+    uint32_t n0 = imu_int_count();
+    uint32_t k;
+
+    /* the INT line is latched until a read, so read the status every
+     * 1 ms, as the PID loop does with the sample */
+    for (k = 0U; k < INT_CHECK_MS; k++)
+    {
+        (void)mpu_read(REG_INT_STATUS, &st, 1U);
+        vTaskDelay(1);
+    }
+    printf("IMU INT: %lu edges in %u ms (expect ~%u)\n",
+           (unsigned long)(imu_int_count() - n0), (unsigned int)INT_CHECK_MS,
+           (unsigned int)INT_CHECK_MS);
+}
+
 /* While idle, answer every key so the serial link can be checked with
  * the motors off. */
 static void keys_echo_idle(void)
@@ -1571,6 +1634,9 @@ static void keys_echo_idle(void)
                 break;
             case 'b':
                 batt_print();
+                break;
+            case 'i':
+                int_print();
                 break;
             default:
                 printf("key '%c' received - motors off, press BOOT to start\n",
@@ -1617,6 +1683,15 @@ void app_main(void)
     else
     {
         /* keys ready */
+    }
+
+    if (imu_int_init() == false)
+    {
+        printf("IMU INT (EXTI) init failed\n");
+    }
+    else
+    {
+        printf("IMU INT (EXTI) on GPIO10\n");
     }
 
     if (adc_batt_init() == false)
