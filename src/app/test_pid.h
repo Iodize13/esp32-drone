@@ -1,25 +1,26 @@
 /*******************************************************************************
- * File Name    : imu_int.h
- * Description  : Header ของ driver EXTI รับ data-ready interrupt จาก MPU6500
- *                (ขา INT -> GPIO10)
+ * File Name    : test_pid.h
+ * Description  : Header ของ angle PID test บน rig แกนเดียว (หรือผูกเชือก 2 แกน)
  * Date         : 2026-10-09
  ******************************************************************************/
-#ifndef IMU_INT_H
-#define IMU_INT_H
+#ifndef TEST_PID_H
+#define TEST_PID_H
 
 /* Includes ------------------------------------------------------------------*/
-#include <stdbool.h>
-#include <stdint.h>
 
 /* Exported typedef/enum/struct/union -----------------------------------------*/
 
 /* Exported define/macro/constants --------------------------------------------*/
+/* angle the IMU reads with the frame level; PID holds this as zero */
+#define PID_TRIM_ROLL_DEG  (0.0f)
+#define PID_TRIM_PITCH_DEG (-2.5f)
+#define AX_ROLL            (0U)            /* controlled axes */
+#define AX_PITCH           (1U)
+#define CTRL_AXES          (2U)
 
 /* Exported variables -----------------------------------------------------------*/
 
 /* Exported function prototypes ------------------------------------------------*/
-bool imu_int_init(void);
-bool imu_int_wait(uint32_t timeout_ms);
-uint32_t imu_int_count(void);
+void test_pid(void);
 
-#endif /* IMU_INT_H */
+#endif /* TEST_PID_H */

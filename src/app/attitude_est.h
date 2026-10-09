@@ -1,25 +1,30 @@
 /*******************************************************************************
- * File Name    : imu_int.h
- * Description  : Header ของ driver EXTI รับ data-ready interrupt จาก MPU6500
- *                (ขา INT -> GPIO10)
+ * File Name    : attitude_est.h
+ * Description  : Header ของ attitude estimator: calibrate gyro bias แล้ว
+ *                อ่าน IMU -> complementary filter -> มุม roll/pitch
  * Date         : 2026-10-09
  ******************************************************************************/
-#ifndef IMU_INT_H
-#define IMU_INT_H
+#ifndef ATTITUDE_EST_H
+#define ATTITUDE_EST_H
 
 /* Includes ------------------------------------------------------------------*/
 #include <stdbool.h>
 #include <stdint.h>
+#include "mpu6500.h"
 
 /* Exported typedef/enum/struct/union -----------------------------------------*/
 
 /* Exported define/macro/constants --------------------------------------------*/
+#define ATT_EST_SETTLE_MS (500U)         /* let the angle settle from accel */
+#define ATT_EST_DT_S      (0.001f)       /* nominal 1 kHz step */
 
 /* Exported variables -----------------------------------------------------------*/
 
 /* Exported function prototypes ------------------------------------------------*/
-bool imu_int_init(void);
-bool imu_int_wait(uint32_t timeout_ms);
-uint32_t imu_int_count(void);
+bool att_est_calibrate(void);
+bool att_est_update(float dt_s, float rate_dps[MPU_AXES]);
+bool att_est_run(uint32_t ms);
+float att_est_roll(void);
+float att_est_pitch(void);
 
-#endif /* IMU_INT_H */
+#endif /* ATTITUDE_EST_H */

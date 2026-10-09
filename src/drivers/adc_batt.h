@@ -1,22 +1,25 @@
-/**
- * adc_batt.h - battery voltage sense on ADC1 via continuous DMA.
- *
- * Driver layer: hardware only. Returns the voltage at the ADC pin; the
- * divider ratio that turns it into battery voltage belongs to the app.
- */
+/*******************************************************************************
+ * File Name    : adc_batt.h
+ * Description  : Header ของ driver วัดแรงดันแบต (ADC1 + DMA ที่ GPIO1)
+ *                driver คืนแรงดันที่ขา ADC เท่านั้น อัตราส่วน divider เป็น
+ *                หน้าที่ของ app layer
+ * Date         : 2026-10-09
+ ******************************************************************************/
 #ifndef ADC_BATT_H
 #define ADC_BATT_H
 
+/* Includes ------------------------------------------------------------------*/
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Start the ADC: DMA fills frames in the background and an ISR
- * averages each finished frame. Returns false if any step failed. */
-bool adc_batt_init(void);
+/* Exported typedef/enum/struct/union -----------------------------------------*/
 
-/* Latest frame average at the pin, in millivolts (calibrated if the
- * chip has eFuse calibration). Returns false if no frame has arrived
- * yet. Task context only. */
+/* Exported define/macro/constants --------------------------------------------*/
+
+/* Exported variables -----------------------------------------------------------*/
+
+/* Exported function prototypes ------------------------------------------------*/
+bool adc_batt_init(void);
 bool adc_batt_pin_mv(uint32_t *mv);
 
 #endif /* ADC_BATT_H */

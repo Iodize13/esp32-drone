@@ -1,45 +1,45 @@
-/**
- * pid.c - angle PID with filtered-gyro D-term and anti-windup.
- *
- * D-term: the gyro already measures d(angle)/dt, so the derivative is
- * taken from the gyro rate instead of differencing the angle (which
- * divides noise by dt = 1 ms and blows it up). The rate is low-pass
- * filtered first because prop vibration lands mostly in the gyro.
- * Using the measurement instead of the error also avoids a "derivative
- * kick" when the setpoint jumps.
- *
- * Anti-windup: the integral is clamped, and it stops growing while the
- * output is saturated in the same direction (conditional integration).
- */
+/*******************************************************************************
+ * File Name    : pid.c
+ * Description  : angle PID ของ app layer (ไม่แตะ hardware) ใช้ทั้งแกน roll และ pitch
+ *                D-term ใช้ gyro rate (ผ่าน low-pass) แทนการ diff มุม เพราะ diff มุม
+ *                หารด้วย dt 1 ms จะขยาย noise และไม่เกิด derivative kick ตอน setpoint เปลี่ยน
+ *                anti-windup: clamp I และหยุดสะสม I ตอน output อิ่มตัวทิศเดียวกัน
+ * Date         : 2026-10-09
+ ******************************************************************************/
 
+/* Includes ------------------------------------------------------------------*/
 #include <stddef.h>
 #include "pid.h"
 
+/* Private includes ------------------------------------------------------------*/
+
+/* Private typedef ------------------------------------------------------------*/
+
+/* Private define ------------------------------------------------------------*/
 #define PI_F          (3.14159265f)
 #define TWO           (2.0f)
 #define ZERO_F        (0.0f)
 #define ONE_F         (1.0f)
 
-static float clampf(float x, float lim)
-{
-    float out;
+/* Private macro ------------------------------------------------------------*/
 
-    if (x > lim)
-    {
-        out = lim;
-    }
-    else if (x < -lim)
-    {
-        out = -lim;
-    }
-    else
-    {
-        out = x;
-    }
+/* Private constants ------------------------------------------------------------*/
 
-    return out;
-}
+/* Private variables ------------------------------------------------------------*/
 
+/* External variables ------------------------------------------------------------*/
+
+/* Private function prototypes ------------------------------------------------*/
+static float clampf(float x, float lim);
+
+/* Private user code ------------------------------------------------------------*/
+
+/* Public functions ------------------------------------------------------------*/
+
+/*
+ * low-pass อันดับ 1: alpha = dt / (RC + dt) โดย RC = 1 / (2 pi fc)
+ * cutoff <= 0 แปลว่าไม่กรอง (alpha = 1)
+ */
 void lpf_init(lpf_t *f, float cutoff_hz, float dt_s)
 {
     float rc;
@@ -64,6 +64,9 @@ void lpf_init(lpf_t *f, float cutoff_hz, float dt_s)
     }
 }
 
+/*
+ * y += alpha * (x - y) ค่าแรกใช้ x ตรงๆ จะได้ไม่ไต่ขึ้นจาก 0
+ */
 float lpf_update(lpf_t *f, float x)
 {
     float out = x;
@@ -89,6 +92,9 @@ float lpf_update(lpf_t *f, float x)
     return out;
 }
 
+/*
+ * คัดลอก gain, ตั้ง filter ของ D ตามคาบ loop แล้วล้าง state
+ */
 void pid_init(pid_ctrl_t *p, const pid_config_t *cfg, float dt_s)
 {
     if ((p != NULL) && (cfg != NULL))
@@ -103,6 +109,10 @@ void pid_init(pid_ctrl_t *p, const pid_config_t *cfg, float dt_s)
     }
 }
 
+/*
+ * ล้าง I และ filter ของ D - เรียกตอนเริ่มบิน หรือเปิด PID กลับ
+ * กันไม่ให้ค่าเก่าค้างแล้วกระชากมอเตอร์
+ */
 void pid_reset(pid_ctrl_t *p)
 {
     if (p != NULL)
@@ -120,6 +130,10 @@ void pid_reset(pid_ctrl_t *p)
     }
 }
 
+/*
+ * คำนวณ 1 รอบ: P = kp * error, D = -kd * gyro rate (กรองแล้ว),
+ * I = ki * integral (clamp + conditional integration) คืนค่ารวมที่ clamp แล้ว
+ */
 float pid_update(pid_ctrl_t *p, float setpoint_deg, float angle_deg,
                  float rate_dps, float dt_s)
 {
@@ -171,6 +185,33 @@ float pid_update(pid_ctrl_t *p, float setpoint_deg, float angle_deg,
     else
     {
         /* invalid arguments - no correction */
+    }
+
+    return out;
+}
+
+/* Callback functions ------------------------------------------------------------*/
+
+/* Private functions ------------------------------------------------------------*/
+
+/*
+ * จำกัด x ให้อยู่ในช่วง -lim .. +lim
+ */
+static float clampf(float x, float lim)
+{
+    float out;
+
+    if (x > lim)
+    {
+        out = lim;
+    }
+    else if (x < -lim)
+    {
+        out = -lim;
+    }
+    else
+    {
+        out = x;
     }
 
     return out;

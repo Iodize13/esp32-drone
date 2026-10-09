@@ -1,24 +1,46 @@
-/**
- * attitude_filter.c - complementary filter for roll and pitch.
- *
- * alpha = tau / (tau + dt). With tau = 0.5 s and dt = 1 ms, alpha is
- * ~0.998: the gyro dominates, the accel slowly removes drift.
- *
- * Accel samples whose magnitude is far from 1 g are skipped. Prop
- * vibration and thrust changes make the accel lie for short moments;
- * trusting the gyro alone for those samples keeps the angle clean.
- */
+/*******************************************************************************
+ * File Name    : attitude_filter.c
+ * Description  : complementary filter หามุม roll/pitch จาก gyro + accel (app layer)
+ *                alpha = tau / (tau + dt): tau 0.5 s, dt 1 ms -> alpha ~0.998 มุมตาม gyro
+ *                และถูกดึงเข้าหามุมจาก accel ช้าๆ เพื่อลบ drift
+ *                sample ที่ขนาด accel ห่างจาก 1 g มาก (แรงสั่น/เร่ง) จะใช้ gyro อย่างเดียว
+ * Date         : 2026-10-09
+ ******************************************************************************/
 
+/* Includes ------------------------------------------------------------------*/
 #include <stddef.h>
 #include <math.h>
 #include "attitude_filter.h"
 
+/* Private includes ------------------------------------------------------------*/
+
+/* Private typedef ------------------------------------------------------------*/
+
+/* Private define ------------------------------------------------------------*/
 #define RAD_TO_DEG   (57.29578f)
 #define ZERO_F       (0.0f)
 #define AX           (0U)
 #define AY           (1U)
 #define AZ           (2U)
+#define ONE_F        (1.0f)
 
+/* Private macro ------------------------------------------------------------*/
+
+/* Private constants ------------------------------------------------------------*/
+
+/* Private variables ------------------------------------------------------------*/
+
+/* External variables ------------------------------------------------------------*/
+
+/* Private function prototypes ------------------------------------------------*/
+
+/* Private user code ------------------------------------------------------------*/
+
+/* Public functions ------------------------------------------------------------*/
+
+/*
+ * ตั้งค่า config และล้างมุม/bias ทั้งหมด
+ */
 void att_init(attitude_t *att, const att_config_t *cfg)
 {
     uint32_t a;
@@ -44,6 +66,9 @@ void att_init(attitude_t *att, const att_config_t *cfg)
     }
 }
 
+/*
+ * สะสม gyro ตอนเครื่องนิ่ง เพื่อหา bias
+ */
 void att_bias_add(attitude_t *att, const float gyro_dps[ATT_AXES])
 {
     uint32_t a;
@@ -62,6 +87,9 @@ void att_bias_add(attitude_t *att, const float gyro_dps[ATT_AXES])
     }
 }
 
+/*
+ * เฉลี่ย bias จากที่สะสมไว้ คืน false ถ้า sample น้อยเกิน (IMU อ่านพลาดบ่อย)
+ */
 bool att_bias_finish(attitude_t *att, uint32_t min_samples)
 {
     bool     ok = false;
@@ -85,6 +113,9 @@ bool att_bias_finish(attitude_t *att, uint32_t min_samples)
     return ok;
 }
 
+/*
+ * ลบ bias ออกจาก gyro ดิบ
+ */
 void att_unbias(const attitude_t *att, const float raw_dps[ATT_AXES],
                 float out_dps[ATT_AXES])
 {
@@ -103,6 +134,10 @@ void att_unbias(const attitude_t *att, const float raw_dps[ATT_AXES],
     }
 }
 
+/*
+ * filter 1 รอบ: มุมจาก gyro (มุมเดิม + rate*dt) ผสมกับมุมจาก accel
+ * รอบแรกที่ accel ใช้ได้ ตั้งมุมจาก accel ตรงๆ (เริ่มจากท่าที่วางอยู่จริง)
+ */
 void att_update(attitude_t *att, const float acc_g[ATT_AXES],
                 const float gyro_dps[ATT_AXES], float dt_s)
 {
@@ -146,8 +181,8 @@ void att_update(attitude_t *att, const float acc_g[ATT_AXES],
             if (att->acc_used == true)
             {
                 alpha          = att->cfg.tau_s / (att->cfg.tau_s + dt_s);
-                att->roll_deg  = (alpha * gyro_roll)  + ((1.0f - alpha) * acc_roll);
-                att->pitch_deg = (alpha * gyro_pitch) + ((1.0f - alpha) * acc_pitch);
+                att->roll_deg  = (alpha * gyro_roll)  + ((ONE_F - alpha) * acc_roll);
+                att->pitch_deg = (alpha * gyro_pitch) + ((ONE_F - alpha) * acc_pitch);
             }
             else
             {
@@ -161,3 +196,7 @@ void att_update(attitude_t *att, const float acc_g[ATT_AXES],
         /* invalid arguments */
     }
 }
+
+/* Callback functions ------------------------------------------------------------*/
+
+/* Private functions ------------------------------------------------------------*/

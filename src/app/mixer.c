@@ -1,18 +1,43 @@
-/**
- * mixer.c - throttle + roll/pitch/yaw corrections -> 4 motor duties.
- *
- * Desaturation: when the mix pushes a motor above max_duty (or below
- * idle_duty), every motor is shifted by the same amount. That keeps the
- * difference between motors - the part that rights the frame - and
- * gives up a little throttle instead. Only if the corrections alone need
- * more than the whole idle..max range are individual motors clipped.
- */
+/*******************************************************************************
+ * File Name    : mixer.c
+ * Description  : รวม throttle กับแรงแก้ roll/pitch/yaw เป็น duty ของมอเตอร์ 4 ตัว
+ *                ถ้ามอเตอร์ตัวไหนเกินช่วง จะเลื่อนทุกตัวเท่ากัน (desaturation) เพื่อรักษา
+ *                ส่วนต่างระหว่างมอเตอร์ซึ่งเป็นตัวแก้มุมไว้ ยอมเสีย throttle นิดหน่อยแทน
+ * Date         : 2026-10-09
+ ******************************************************************************/
 
+/* Includes ------------------------------------------------------------------*/
 #include <stddef.h>
 #include "mixer.h"
 
-#define ZERO_F  (0.0f)
+/* Private includes ------------------------------------------------------------*/
 
+/* Private typedef ------------------------------------------------------------*/
+
+/* Private define ------------------------------------------------------------*/
+#define ZERO_F  (0.0f)
+#define MIX_INIT_HI   (-1.0e9f)
+#define MIX_INIT_LO   (1.0e9f)
+#define ROUND_HALF    (0.5f)
+
+/* Private macro ------------------------------------------------------------*/
+
+/* Private constants ------------------------------------------------------------*/
+
+/* Private variables ------------------------------------------------------------*/
+
+/* External variables ------------------------------------------------------------*/
+
+/* Private function prototypes ------------------------------------------------*/
+
+/* Private user code ------------------------------------------------------------*/
+
+/* Public functions ------------------------------------------------------------*/
+
+/*
+ * duty[i] = throttle + roll[i]*roll + pitch[i]*pitch + yaw[i]*yaw
+ * throttle 0 = disarm: มอเตอร์ดับหมด ไม่สนแรงแก้
+ */
 void mixer_mix(const mixer_config_t *cfg, uint16_t throttle,
                float roll, float pitch, float yaw,
                uint16_t duty_out[MIXER_MOTORS])
@@ -40,8 +65,8 @@ void mixer_mix(const mixer_config_t *cfg, uint16_t throttle,
         }
         else
         {
-            hi = -1.0e9f;
-            lo = 1.0e9f;
+            hi = MIX_INIT_HI;
+            lo = MIX_INIT_LO;
 
             for (m = 0U; m < MIXER_MOTORS; m++)
             {
@@ -50,8 +75,22 @@ void mixer_mix(const mixer_config_t *cfg, uint16_t throttle,
                        + ((float)cfg->pitch[m] * pitch)
                        + ((float)cfg->yaw[m]   * yaw);
 
-                if (mix[m] > hi) { hi = mix[m]; } else { /* keep */ }
-                if (mix[m] < lo) { lo = mix[m]; } else { /* keep */ }
+                if (mix[m] > hi)
+                {
+                    hi = mix[m];
+                }
+                else
+                {
+                    /* No action */
+                }
+                if (mix[m] < lo)
+                {
+                    lo = mix[m];
+                }
+                else
+                {
+                    /* No action */
+                }
             }
 
             if (hi > top)
@@ -84,7 +123,7 @@ void mixer_mix(const mixer_config_t *cfg, uint16_t throttle,
                     /* in range */
                 }
 
-                duty_out[m] = (uint16_t)(mix[m] + 0.5f);   /* round */
+                duty_out[m] = (uint16_t)(mix[m] + ROUND_HALF);   /* round */
             }
         }
     }
@@ -93,3 +132,7 @@ void mixer_mix(const mixer_config_t *cfg, uint16_t throttle,
         /* invalid arguments - nothing written */
     }
 }
+
+/* Callback functions ------------------------------------------------------------*/
+
+/* Private functions ------------------------------------------------------------*/

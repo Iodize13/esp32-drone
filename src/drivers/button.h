@@ -1,15 +1,13 @@
 /*******************************************************************************
- * File Name    : imu_int.h
- * Description  : Header ของ driver EXTI รับ data-ready interrupt จาก MPU6500
- *                (ขา INT -> GPIO10)
+ * File Name    : button.h
+ * Description  : Header ของ driver ปุ่ม BOOT (GPIO0, active-low)
  * Date         : 2026-10-09
  ******************************************************************************/
-#ifndef IMU_INT_H
-#define IMU_INT_H
+#ifndef BUTTON_H
+#define BUTTON_H
 
 /* Includes ------------------------------------------------------------------*/
 #include <stdbool.h>
-#include <stdint.h>
 
 /* Exported typedef/enum/struct/union -----------------------------------------*/
 
@@ -18,8 +16,8 @@
 /* Exported variables -----------------------------------------------------------*/
 
 /* Exported function prototypes ------------------------------------------------*/
-bool imu_int_init(void);
-bool imu_int_wait(uint32_t timeout_ms);
-uint32_t imu_int_count(void);
+void button_init(void);
+bool button_pressed(void);
+void button_wait_release(void);
 
-#endif /* IMU_INT_H */
+#endif /* BUTTON_H */

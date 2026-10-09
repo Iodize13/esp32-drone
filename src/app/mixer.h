@@ -1,6 +1,20 @@
-/**
- * mixer.h - throttle + roll/pitch/yaw corrections -> 4 motor duties.
- *
+/*******************************************************************************
+ * File Name    : mixer.h
+ * Description  : Header ของ mixer: throttle + แรงแก้ roll/pitch/yaw -> duty มอเตอร์ 4 ตัว
+ *                เครื่องหมายของแต่ละมอเตอร์ได้จาก mapping test (ห้ามเดา - ผิดแล้วเครื่องพลิก)
+ * Date         : 2026-10-09
+ ******************************************************************************/
+#ifndef MIXER_H
+#define MIXER_H
+
+/* Includes ------------------------------------------------------------------*/
+#include <stdint.h>
+
+/* Exported define/macro/constants --------------------------------------------*/
+#define MIXER_MOTORS  (4U)
+
+/* Exported typedef/enum/struct/union -----------------------------------------*/
+/*
  * Application layer: output is per-mille duty (0..1000) for the PWM
  * driver; no hardware access here.
  *
@@ -25,14 +39,6 @@
  *          opposite way to the prop).
  * Verify each sign with the motor test before flying.
  */
-
-#ifndef MIXER_H
-#define MIXER_H
-
-#include <stdint.h>
-
-#define MIXER_MOTORS  (4U)
-
 typedef struct
 {
     int8_t   roll[MIXER_MOTORS];    /* +1 / -1 / 0 */
@@ -42,6 +48,9 @@ typedef struct
     uint16_t idle_duty;             /* per-mille floor while armed       */
 } mixer_config_t;
 
+/* Exported variables -----------------------------------------------------------*/
+
+/* Exported function prototypes ------------------------------------------------*/
 /**
  * throttle      : per-mille 0..max_duty. 0 = motors off (disarmed path).
  * roll/pitch/yaw: PID corrections in per-mille.

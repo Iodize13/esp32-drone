@@ -1,20 +1,20 @@
-/**
- * attitude_filter.h - complementary filter for roll and pitch.
- *
- * Application layer: takes scaled sensor values (g, dps), no I2C here.
- * Gyro is accurate short-term but drifts; accel has no drift but picks
- * up vibration and any acceleration. Blend the two: angle follows the
- * gyro, and is pulled slowly toward the accel angle.
- */
-
+/*******************************************************************************
+ * File Name    : attitude_filter.h
+ * Description  : Header ของ complementary filter หามุม roll/pitch (app layer)
+ *                gyro แม่นระยะสั้นแต่ drift, accel ไม่ drift แต่โดนแรงสั่นกวน จึงผสมกัน
+ * Date         : 2026-10-09
+ ******************************************************************************/
 #ifndef ATTITUDE_FILTER_H
 #define ATTITUDE_FILTER_H
 
+/* Includes ------------------------------------------------------------------*/
 #include <stdint.h>
 #include <stdbool.h>
 
+/* Exported define/macro/constants --------------------------------------------*/
 #define ATT_AXES  (3U)
 
+/* Exported typedef/enum/struct/union -----------------------------------------*/
 typedef struct
 {
     float tau_s;        /* time constant: how slowly accel corrects drift */
@@ -34,6 +34,9 @@ typedef struct
     bool         acc_used;      /* last update used the accel          */
 } attitude_t;
 
+/* Exported variables -----------------------------------------------------------*/
+
+/* Exported function prototypes ------------------------------------------------*/
 void att_init(attitude_t *att, const att_config_t *cfg);
 
 /* Gyro bias: feed samples while the frame is still, then finish. */

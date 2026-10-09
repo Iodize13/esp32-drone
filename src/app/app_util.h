@@ -1,11 +1,11 @@
 /*******************************************************************************
- * File Name    : imu_int.h
- * Description  : Header ของ driver EXTI รับ data-ready interrupt จาก MPU6500
- *                (ขา INT -> GPIO10)
+ * File Name    : app_util.h
+ * Description  : Header ของฟังก์ชันช่วยที่ทุกการทดสอบใช้ร่วมกัน
+ *                (รอแบบกด BOOT ยกเลิกได้, นับถอยหลัง, ค่าสัมบูรณ์ float)
  * Date         : 2026-10-09
  ******************************************************************************/
-#ifndef IMU_INT_H
-#define IMU_INT_H
+#ifndef APP_UTIL_H
+#define APP_UTIL_H
 
 /* Includes ------------------------------------------------------------------*/
 #include <stdbool.h>
@@ -14,12 +14,14 @@
 /* Exported typedef/enum/struct/union -----------------------------------------*/
 
 /* Exported define/macro/constants --------------------------------------------*/
+#define MS_PER_S          (1000U)
+#define US_PER_MS         (1000)
 
 /* Exported variables -----------------------------------------------------------*/
 
 /* Exported function prototypes ------------------------------------------------*/
-bool imu_int_init(void);
-bool imu_int_wait(uint32_t timeout_ms);
-uint32_t imu_int_count(void);
+bool app_wait_abortable(uint32_t ms);
+bool app_countdown(void);
+float app_absf(float x);
 
-#endif /* IMU_INT_H */
+#endif /* APP_UTIL_H */

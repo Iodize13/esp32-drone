@@ -1,17 +1,17 @@
-/**
- * pid.h - angle PID with filtered-gyro D-term and anti-windup.
- *
- * Application layer: no register or driver access. Inputs are plain
- * numbers (degrees, dps, seconds); output is a correction in per-mille
- * duty that the mixer adds to / subtracts from the motors.
- */
-
+/*******************************************************************************
+ * File Name    : pid.h
+ * Description  : Header ของ angle PID (app layer, ไม่แตะ hardware)
+ *                input เป็นองศา, dps, วินาที - output เป็นแรงแก้หน่วย per-mille ให้ mixer
+ * Date         : 2026-10-09
+ ******************************************************************************/
 #ifndef PID_H
 #define PID_H
 
+/* Includes ------------------------------------------------------------------*/
 #include <stdint.h>
 #include <stdbool.h>
 
+/* Exported typedef/enum/struct/union -----------------------------------------*/
 /* first-order low-pass filter state */
 typedef struct
 {
@@ -40,6 +40,11 @@ typedef struct
     float        last_d;
 } pid_ctrl_t;
 
+/* Exported define/macro/constants --------------------------------------------*/
+
+/* Exported variables -----------------------------------------------------------*/
+
+/* Exported function prototypes ------------------------------------------------*/
 void  lpf_init(lpf_t *f, float cutoff_hz, float dt_s);
 float lpf_update(lpf_t *f, float x);
 

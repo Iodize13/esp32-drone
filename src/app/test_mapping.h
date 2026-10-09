@@ -1,15 +1,12 @@
 /*******************************************************************************
- * File Name    : imu_int.h
- * Description  : Header ของ driver EXTI รับ data-ready interrupt จาก MPU6500
- *                (ขา INT -> GPIO10)
+ * File Name    : test_mapping.h
+ * Description  : Header ของ motor mapping test (หาว่ามอเตอร์แต่ละตัวอยู่มุมไหน)
  * Date         : 2026-10-09
  ******************************************************************************/
-#ifndef IMU_INT_H
-#define IMU_INT_H
+#ifndef TEST_MAPPING_H
+#define TEST_MAPPING_H
 
 /* Includes ------------------------------------------------------------------*/
-#include <stdbool.h>
-#include <stdint.h>
 
 /* Exported typedef/enum/struct/union -----------------------------------------*/
 
@@ -18,8 +15,6 @@
 /* Exported variables -----------------------------------------------------------*/
 
 /* Exported function prototypes ------------------------------------------------*/
-bool imu_int_init(void);
-bool imu_int_wait(uint32_t timeout_ms);
-uint32_t imu_int_count(void);
+void test_mapping(void);
 
-#endif /* IMU_INT_H */
+#endif /* TEST_MAPPING_H */
